@@ -1,0 +1,11 @@
+{
+  "name": "confluence-mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal MCP server for Confluence search and page fetch",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/server.mjs"
+  }
+}

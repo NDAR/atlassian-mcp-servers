@@ -1,0 +1,11 @@
+{
+  "name": "jira-mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal read-only MCP server for Jira issue search and fetch",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/server.mjs"
+  }
+}
