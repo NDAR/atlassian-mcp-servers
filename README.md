@@ -5,9 +5,11 @@ Standalone MCP servers for NDAR Atlassian services.
 ## Servers
 
 - `confluence-mcp-server`: Confluence search, page fetch, page create/update, and comment tools
-- `jira-mcp-server`: read-only Jira issue, project, and current-user lookup tools
+- `jira-mcp-server`: Jira issue/project lookup, issue create/update, transition, assignment, and comment tools
 
 Each server is dependency-free and uses Node's built-in `fetch`.
+
+Both servers include write-capable tools. Write tools default to dry-run mode and require a second call with a matching `confirmationToken` before they create or update anything.
 
 ## Codex Desktop Setup
 
