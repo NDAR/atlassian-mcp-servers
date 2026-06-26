@@ -1,6 +1,6 @@
-# NDAR MCP Servers
+# Atlassian Jira and Confluence (Data Center) MCP Servers
 
-Standalone MCP servers for NDAR Atlassian services.
+Standalone MCP servers for Data Center Atlassian services.
 
 ## Servers
 
