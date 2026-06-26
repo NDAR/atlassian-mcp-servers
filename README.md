@@ -130,7 +130,7 @@ args = ["--use-system-ca", "/path/to/mcp-servers/confluence-mcp-server/src/serve
 
 [mcp_servers.confluence.env]
 CONFLUENCE_AUTH_MODE = "bearer"
-CONFLUENCE_BASE_URL = "https://wiki.nimhda.org"
+CONFLUENCE_BASE_URL = "PASTE_CONFLUENCE_URL_HERE"
 CONFLUENCE_API_PATH = "/rest/api"
 CONFLUENCE_PAT = "PASTE_YOUR_CONFLUENCE_PAT_HERE"
 
@@ -141,7 +141,7 @@ args = ["--use-system-ca", "/path/to/mcp-servers/jira-mcp-server/src/server.mjs"
 
 [mcp_servers.jira.env]
 JIRA_AUTH_MODE = "bearer"
-JIRA_BASE_URL = "https://jira.nimhda.org"
+JIRA_BASE_URL = "PASTE_JIRA_URL_HERE"
 JIRA_API_PATH = "/rest/api/2"
 JIRA_PAT = "PASTE_YOUR_JIRA_PAT_HERE"
 ```
@@ -298,7 +298,7 @@ args = ["--use-system-ca", "C:/path/to/mcp-servers/confluence-mcp-server/src/ser
 
 [mcp_servers.confluence.env]
 CONFLUENCE_AUTH_MODE = "bearer"
-CONFLUENCE_BASE_URL = "https://wiki.nimhda.org"
+CONFLUENCE_BASE_URL = "PASTE_CONFLUENCE_URL_HERE"
 CONFLUENCE_API_PATH = "/rest/api"
 CONFLUENCE_PAT = "PASTE_YOUR_CONFLUENCE_PAT_HERE"
 
@@ -309,7 +309,7 @@ args = ["--use-system-ca", "C:/path/to/mcp-servers/jira-mcp-server/src/server.mj
 
 [mcp_servers.jira.env]
 JIRA_AUTH_MODE = "bearer"
-JIRA_BASE_URL = "https://jira.nimhda.org"
+JIRA_BASE_URL = "PASTE_JIRA_URL_HERE"
 JIRA_API_PATH = "/rest/api/2"
 JIRA_PAT = "PASTE_YOUR_JIRA_PAT_HERE"
 ```
