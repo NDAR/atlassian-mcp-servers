@@ -85,7 +85,7 @@ export const TOOL_DEFINITIONS = [
         },
         bodyStorage: {
           type: "string",
-          description: "Confluence storage-format XHTML body."
+          description: "Confluence storage-format XHTML body. For generated pages, put the generated date and a brief Codex update description at the top; the server wraps that standard intro in a quote block by default."
         },
         parentPageId: {
           type: "string",
@@ -125,7 +125,7 @@ export const TOOL_DEFINITIONS = [
         },
         bodyStorage: {
           type: "string",
-          description: "Optional replacement storage-format XHTML body. Defaults to current body."
+          description: "Optional replacement storage-format XHTML body. Defaults to current body. For generated updates, put the generated date and a brief Codex update description at the top; the server wraps that standard intro in a quote block by default."
         },
         versionMessage: {
           type: "string",
@@ -446,7 +446,7 @@ async function confluenceCreatePage(args) {
   const config = readConfig();
   const spaceKey = requiredString(args.spaceKey, "spaceKey");
   const title = requiredString(args.title, "title");
-  const bodyStorage = requiredString(args.bodyStorage, "bodyStorage");
+  const bodyStorage = quoteGeneratedIntro(requiredString(args.bodyStorage, "bodyStorage"));
   const parentPageId = stringOrUndefined(args.parentPageId);
   const payload = buildCreatePagePayload({ spaceKey, title, bodyStorage, parentPageId });
   const tokenPayload = {
@@ -495,7 +495,10 @@ async function confluenceUpdatePage(args) {
   assertCurrentVersion(currentPage, currentVersion);
 
   const title = nextTitle ?? currentPage.title;
-  const bodyStorage = nextBodyStorage ?? currentPage.bodyStorage;
+  const bodyStorage =
+    nextBodyStorage === undefined
+      ? currentPage.bodyStorage
+      : quoteGeneratedIntro(nextBodyStorage);
   if (!title) {
     throw new Error("Current page title is unavailable; title is required");
   }
@@ -654,6 +657,52 @@ function buildAddCommentPayload({ pageId, bodyStorage }) {
       }
     }
   };
+}
+
+function quoteGeneratedIntro(bodyStorage) {
+  const metadataParagraphPattern =
+    /<p\b[^>]*>\s*<strong>\s*(?:Generated|Latest source snapshot found|Codex update)\s*:\s*<\/strong>[\s\S]*?<\/p>/gi;
+  const firstMetadataMatch = metadataParagraphPattern.exec(bodyStorage);
+
+  if (!firstMetadataMatch) {
+    return bodyStorage;
+  }
+
+  const prefix = bodyStorage.slice(0, firstMetadataMatch.index);
+  const generatedStartsAfterTitle =
+    prefix.trim() === "" || /^<h1\b[\s\S]*<\/h1>$/i.test(prefix.trim());
+  if (!generatedStartsAfterTitle || /<blockquote\b/i.test(prefix)) {
+    return bodyStorage;
+  }
+
+  metadataParagraphPattern.lastIndex = firstMetadataMatch.index;
+  const matches = [];
+  let searchIndex = firstMetadataMatch.index;
+  let match;
+  while ((match = metadataParagraphPattern.exec(bodyStorage)) !== null) {
+    if (bodyStorage.slice(searchIndex, match.index).trim() !== "") {
+      break;
+    }
+    matches.push(match);
+    searchIndex = match.index + match[0].length;
+  }
+
+  const hasGenerated = matches.some((item) => /<strong>\s*Generated\s*:/i.test(item[0]));
+  const hasCodexUpdate = matches.some((item) => /<strong>\s*Codex update\s*:/i.test(item[0]));
+  if (!hasGenerated || !hasCodexUpdate) {
+    return bodyStorage;
+  }
+
+  const quoteStart = matches[0].index;
+  const quoteEnd = matches.at(-1).index + matches.at(-1)[0].length;
+  if (/^<blockquote\b/i.test(bodyStorage.slice(quoteStart).trimStart())) {
+    return bodyStorage;
+  }
+
+  return `${bodyStorage.slice(0, quoteStart)}<blockquote>${bodyStorage.slice(
+    quoteStart,
+    quoteEnd
+  )}</blockquote>${bodyStorage.slice(quoteEnd)}`;
 }
 
 async function fetchCurrentPageForUpdate(config, pageId) {

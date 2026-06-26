@@ -1,4 +1,6 @@
 import { Buffer } from "node:buffer";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 const SERVER_INFO = {
   name: "jira-mcp-server",
@@ -12,6 +14,9 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
   "2024-10-07",
   "2024-09-03"
 ];
+
+const CONFIRMATION_TOKEN_TTL_SECONDS = 600;
+const CODEX_ATTRIBUTION_LABEL = "codex-assisted";
 
 const DEFAULT_SEARCH_FIELDS = [
   "summary",
@@ -35,7 +40,7 @@ const DEFAULT_ISSUE_FIELDS = [
   "versions"
 ];
 
-const TOOL_DEFINITIONS = [
+export const TOOL_DEFINITIONS = [
   {
     name: "jira_search",
     description: "Search Jira issues by free-text query or raw JQL.",
@@ -130,22 +135,282 @@ const TOOL_DEFINITIONS = [
       properties: {},
       additionalProperties: false
     }
+  },
+  {
+    name: "jira_create_issue",
+    description: "Dry-run or create a Jira issue from common fields plus raw fields.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectKey: {
+          type: "string",
+          description: "Jira project key where the issue will be created."
+        },
+        issueType: {
+          type: "string",
+          description: "Issue type name, for example Task, Story, Bug, or Epic."
+        },
+        summary: {
+          type: "string",
+          description: "Issue summary."
+        },
+        description: {
+          type: "string",
+          description: "Optional issue description."
+        },
+        priority: {
+          type: "string",
+          description: "Optional priority name."
+        },
+        assignee: {
+          type: "object",
+          description: "Optional assignee object with name or accountId.",
+          additionalProperties: true
+        },
+        labels: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional labels. codex-assisted is added by default."
+        },
+        components: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional component names."
+        },
+        fixVersions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional fix version names."
+        },
+        fields: {
+          type: "object",
+          description: "Optional raw Jira fields that extend or override mapped fields.",
+          additionalProperties: true
+        },
+        codexAttribution: {
+          type: "boolean",
+          description: "Default true. Set false to suppress Codex labels, footers, and audit comments."
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Default true. Set false to execute with a valid confirmationToken."
+        },
+        confirmationToken: {
+          type: "string",
+          description: "Token returned by a matching dry-run preview."
+        }
+      },
+      required: ["projectKey", "issueType", "summary"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "jira_update_issue",
+    description: "Dry-run or update Jira issue fields and Jira-native update operations.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueKey: {
+          type: "string",
+          description: "Jira issue key or ID, for example PROJ-123."
+        },
+        summary: { type: "string", description: "Optional replacement summary." },
+        description: { type: "string", description: "Optional replacement description." },
+        priority: { type: "string", description: "Optional priority name." },
+        assignee: {
+          type: "object",
+          description: "Optional assignee field object with name or accountId.",
+          additionalProperties: true
+        },
+        labels: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional replacement labels."
+        },
+        components: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional replacement component names."
+        },
+        fixVersions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional replacement fix version names."
+        },
+        fields: {
+          type: "object",
+          description: "Optional raw Jira fields that extend or override mapped fields.",
+          additionalProperties: true
+        },
+        update: {
+          type: "object",
+          description: "Optional Jira-native update object.",
+          additionalProperties: true
+        },
+        codexAttribution: {
+          type: "boolean",
+          description: "Default true. Set false to suppress Codex audit comments."
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Default true. Set false to execute with a valid confirmationToken."
+        },
+        confirmationToken: {
+          type: "string",
+          description: "Token returned by a matching dry-run preview."
+        }
+      },
+      required: ["issueKey"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "jira_transition_issue",
+    description: "Dry-run or transition a Jira issue, optionally with fields/update/comment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueKey: {
+          type: "string",
+          description: "Jira issue key or ID, for example PROJ-123."
+        },
+        transitionId: {
+          type: "string",
+          description: "Jira workflow transition ID."
+        },
+        fields: {
+          type: "object",
+          description: "Optional raw Jira fields for the transition.",
+          additionalProperties: true
+        },
+        update: {
+          type: "object",
+          description: "Optional Jira-native update object for the transition.",
+          additionalProperties: true
+        },
+        comment: {
+          type: "string",
+          description: "Optional transition comment."
+        },
+        codexAttribution: {
+          type: "boolean",
+          description: "Default true. Set false to suppress Codex audit comments."
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Default true. Set false to execute with a valid confirmationToken."
+        },
+        confirmationToken: {
+          type: "string",
+          description: "Token returned by a matching dry-run preview."
+        }
+      },
+      required: ["issueKey", "transitionId"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "jira_assign_issue",
+    description: "Dry-run or assign, reassign, or unassign a Jira issue.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueKey: {
+          type: "string",
+          description: "Jira issue key or ID, for example PROJ-123."
+        },
+        name: {
+          type: "string",
+          description: "Jira username for Data Center assignment."
+        },
+        accountId: {
+          type: "string",
+          description: "Jira accountId for Cloud-compatible assignment."
+        },
+        unassign: {
+          type: "boolean",
+          description: "Set true to unassign the issue."
+        },
+        codexAttribution: {
+          type: "boolean",
+          description: "Default true. Set false to suppress Codex audit comments."
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Default true. Set false to execute with a valid confirmationToken."
+        },
+        confirmationToken: {
+          type: "string",
+          description: "Token returned by a matching dry-run preview."
+        }
+      },
+      required: ["issueKey"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "jira_add_comment",
+    description: "Dry-run or add a comment to a Jira issue.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueKey: {
+          type: "string",
+          description: "Jira issue key or ID, for example PROJ-123."
+        },
+        body: {
+          type: "string",
+          description: "Comment body. A Codex attribution footer is appended by default."
+        },
+        codexAttribution: {
+          type: "boolean",
+          description: "Default true. Set false to suppress the Codex attribution footer."
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Default true. Set false to execute with a valid confirmationToken."
+        },
+        confirmationToken: {
+          type: "string",
+          description: "Token returned by a matching dry-run preview."
+        }
+      },
+      required: ["issueKey", "body"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "jira_list_transitions",
+    description: "List available workflow transitions for a Jira issue.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueKey: {
+          type: "string",
+          description: "Jira issue key or ID, for example PROJ-123."
+        }
+      },
+      required: ["issueKey"],
+      additionalProperties: false
+    }
   }
 ];
 
 let inputBuffer = Buffer.alloc(0);
 let outputMode = "line";
 
-process.stdin.on("data", (chunk) => {
-  inputBuffer = Buffer.concat([inputBuffer, chunk]);
-  processIncomingMessages().catch((error) => {
-    logError("failed to process incoming message", error);
+export function startStdioServer() {
+  process.stdin.on("data", (chunk) => {
+    inputBuffer = Buffer.concat([inputBuffer, chunk]);
+    processIncomingMessages().catch((error) => {
+      logError("failed to process incoming message", error);
+    });
   });
-});
 
-process.stdin.on("end", () => {
-  process.exit(0);
-});
+  process.stdin.on("end", () => {
+    process.exit(0);
+  });
+}
 
 async function processIncomingMessages() {
   while (true) {
@@ -314,7 +579,7 @@ function handleInitialize(params) {
   };
 }
 
-async function handleToolCall(params) {
+export async function handleToolCall(params) {
   const toolName = params.name;
   const args = params.arguments ?? {};
 
@@ -327,6 +592,18 @@ async function handleToolCall(params) {
       return await runToolSafely(() => jiraListProjects(args));
     case "jira_myself":
       return await runToolSafely(() => jiraMyself());
+    case "jira_create_issue":
+      return await runToolSafely(() => jiraCreateIssue(args));
+    case "jira_update_issue":
+      return await runToolSafely(() => jiraUpdateIssue(args));
+    case "jira_transition_issue":
+      return await runToolSafely(() => jiraTransitionIssue(args));
+    case "jira_assign_issue":
+      return await runToolSafely(() => jiraAssignIssue(args));
+    case "jira_add_comment":
+      return await runToolSafely(() => jiraAddComment(args));
+    case "jira_list_transitions":
+      return await runToolSafely(() => jiraListTransitions(args));
     default:
       return toolError(`Unknown tool: ${toolName}`);
   }
@@ -448,6 +725,290 @@ async function jiraMyself() {
   });
 }
 
+async function jiraCreateIssue(args) {
+  const config = readConfig();
+  const projectKey = requiredString(args.projectKey, "projectKey");
+  const issueType = requiredString(args.issueType, "issueType");
+  const summary = requiredString(args.summary, "summary");
+  const codexAttribution = args.codexAttribution !== false;
+  const fields = {
+    project: { key: projectKey },
+    issuetype: { name: issueType },
+    summary,
+    ...buildCommonIssueFields(args),
+    ...objectOrUndefined(args.fields, "fields")
+  };
+
+  if (codexAttribution) {
+    fields.labels = addUniqueLabel(fields.labels, CODEX_ATTRIBUTION_LABEL);
+    fields.description = appendDescriptionFooter(
+      fields.description,
+      `Created with Codex via Jira MCP on ${currentDateString()} at the user's request.`
+    );
+  }
+
+  const payload = { fields };
+  const tokenPayload = buildTokenPayload({
+    operation: "jira_create_issue",
+    method: "POST",
+    endpointPath: "/issue",
+    target: { projectKey },
+    payload
+  });
+  const preview = buildWritePreview(config, tokenPayload, {
+    target: { projectKey },
+    summary
+  });
+
+  return await previewOrExecuteWrite({
+    config,
+    args,
+    tokenPayload,
+    preview,
+    execute: async () => {
+      const data = await jiraRequest(config, "/issue", {
+        method: "POST",
+        body: payload
+      });
+      return normalizeWriteIssueResult(config.baseUrl, data);
+    }
+  });
+}
+
+async function jiraUpdateIssue(args) {
+  const config = readConfig();
+  const issueKey = requiredString(args.issueKey, "issueKey");
+  const fields = {
+    ...buildCommonIssueFields(args),
+    ...objectOrUndefined(args.fields, "fields")
+  };
+  const update = objectOrUndefined(args.update, "update");
+  if (Object.keys(fields).length === 0 && !update) {
+    throw new Error("At least one field or update operation is required");
+  }
+
+  const payload = {};
+  if (Object.keys(fields).length > 0) {
+    payload.fields = fields;
+  }
+  if (update) {
+    payload.update = update;
+  }
+
+  const auditComment = args.codexAttribution === false
+    ? null
+    : `Codex via Jira MCP updated this issue on ${currentDateString()}.`;
+  const endpointPath = `/issue/${encodeURIComponent(issueKey)}`;
+  const tokenPayload = buildTokenPayload({
+    operation: "jira_update_issue",
+    method: "PUT",
+    endpointPath,
+    target: { issueKey },
+    payload,
+    auditComment
+  });
+  const preview = buildWritePreview(config, tokenPayload, {
+    target: { issueKey }
+  });
+
+  return await previewOrExecuteWrite({
+    config,
+    args,
+    tokenPayload,
+    preview,
+    execute: async () => {
+      await jiraRequest(config, endpointPath, {
+        method: "PUT",
+        body: payload
+      });
+      const audit = auditComment
+        ? await postJiraComment(config, issueKey, auditComment)
+        : null;
+      return normalizeMutationResult(config.baseUrl, issueKey, { auditComment: audit });
+    }
+  });
+}
+
+async function jiraTransitionIssue(args) {
+  const config = readConfig();
+  const issueKey = requiredString(args.issueKey, "issueKey");
+  const transitionId = requiredString(args.transitionId, "transitionId");
+  const fields = objectOrUndefined(args.fields, "fields");
+  let update = objectOrUndefined(args.update, "update");
+  const comment = stringOrUndefined(args.comment);
+  if (comment) {
+    update = appendUpdateComment(update, comment);
+  }
+
+  const payload = {
+    transition: { id: transitionId }
+  };
+  if (fields) {
+    payload.fields = fields;
+  }
+  if (update) {
+    payload.update = update;
+  }
+
+  const auditComment = args.codexAttribution === false
+    ? null
+    : `Codex via Jira MCP transitioned this issue using transition ${transitionId} on ${currentDateString()}.`;
+  const endpointPath = `/issue/${encodeURIComponent(issueKey)}/transitions`;
+  const tokenPayload = buildTokenPayload({
+    operation: "jira_transition_issue",
+    method: "POST",
+    endpointPath,
+    target: { issueKey },
+    payload,
+    auditComment
+  });
+  const preview = buildWritePreview(config, tokenPayload, {
+    target: { issueKey },
+    transitionId
+  });
+
+  return await previewOrExecuteWrite({
+    config,
+    args,
+    tokenPayload,
+    preview,
+    execute: async () => {
+      await jiraRequest(config, endpointPath, {
+        method: "POST",
+        body: payload
+      });
+      const audit = auditComment
+        ? await postJiraComment(config, issueKey, auditComment)
+        : null;
+      return normalizeMutationResult(config.baseUrl, issueKey, {
+        transitionId,
+        auditComment: audit
+      });
+    }
+  });
+}
+
+async function jiraAssignIssue(args) {
+  const config = readConfig();
+  const issueKey = requiredString(args.issueKey, "issueKey");
+  const unassign = args.unassign === true;
+  const name = stringOrUndefined(args.name);
+  const accountId = stringOrUndefined(args.accountId);
+
+  if (!unassign && !name && !accountId) {
+    throw new Error("Either name, accountId, or unassign must be provided");
+  }
+  if (unassign && (name || accountId)) {
+    throw new Error("unassign cannot be combined with name or accountId");
+  }
+
+  const payload = unassign
+    ? { name: null }
+    : accountId
+      ? { accountId }
+      : { name };
+  const auditComment = args.codexAttribution === false
+    ? null
+    : `Codex via Jira MCP updated this issue's assignee on ${currentDateString()}.`;
+  const endpointPath = `/issue/${encodeURIComponent(issueKey)}/assignee`;
+  const tokenPayload = buildTokenPayload({
+    operation: "jira_assign_issue",
+    method: "PUT",
+    endpointPath,
+    target: { issueKey },
+    payload,
+    auditComment
+  });
+  const preview = buildWritePreview(config, tokenPayload, {
+    target: { issueKey }
+  });
+
+  return await previewOrExecuteWrite({
+    config,
+    args,
+    tokenPayload,
+    preview,
+    execute: async () => {
+      await jiraRequest(config, endpointPath, {
+        method: "PUT",
+        body: payload
+      });
+      const audit = auditComment
+        ? await postJiraComment(config, issueKey, auditComment)
+        : null;
+      return normalizeMutationResult(config.baseUrl, issueKey, { auditComment: audit });
+    }
+  });
+}
+
+async function jiraAddComment(args) {
+  const config = readConfig();
+  const issueKey = requiredString(args.issueKey, "issueKey");
+  const body = requiredString(args.body, "body");
+  const commentBody = args.codexAttribution === false
+    ? body
+    : appendCommentFooter(body, "Posted with Codex via Jira MCP.");
+  const payload = { body: commentBody };
+  const endpointPath = `/issue/${encodeURIComponent(issueKey)}/comment`;
+  const tokenPayload = buildTokenPayload({
+    operation: "jira_add_comment",
+    method: "POST",
+    endpointPath,
+    target: { issueKey },
+    payload
+  });
+  const preview = buildWritePreview(config, tokenPayload, {
+    target: { issueKey }
+  });
+
+  return await previewOrExecuteWrite({
+    config,
+    args,
+    tokenPayload,
+    preview,
+    execute: async () => {
+      const comment = await jiraRequest(config, endpointPath, {
+        method: "POST",
+        body: payload
+      });
+      return normalizeMutationResult(config.baseUrl, issueKey, {
+        comment: normalizeComment(comment)
+      });
+    }
+  });
+}
+
+async function jiraListTransitions(args) {
+  const config = readConfig();
+  const issueKey = requiredString(args.issueKey, "issueKey");
+  const data = await jiraRequest(
+    config,
+    `/issue/${encodeURIComponent(issueKey)}/transitions`,
+    {
+      queryParams: { expand: "transitions.fields" }
+    }
+  );
+  const transitions = Array.isArray(data.transitions) ? data.transitions : [];
+
+  return jsonContent({
+    issueKey,
+    count: transitions.length,
+    transitions: transitions.map((transition) => ({
+      id: transition.id ?? null,
+      name: transition.name ?? null,
+      to: transition.to
+        ? {
+            id: transition.to.id ?? null,
+            name: transition.to.name ?? null,
+            statusCategory: transition.to.statusCategory?.name ?? null
+          }
+        : null,
+      hasScreen: transition.hasScreen ?? null,
+      fields: normalizeTransitionFields(transition.fields)
+    }))
+  });
+}
+
 function readConfig() {
   const baseUrlValue = stringOrUndefined(process.env.JIRA_BASE_URL);
   if (!baseUrlValue) {
@@ -485,6 +1046,7 @@ function readConfig() {
     email,
     apiToken,
     bearerToken: token,
+    authSecret: authMode === "basic" ? password ?? apiToken : token,
     defaultProjectKey: stringOrUndefined(process.env.JIRA_PROJECT_KEY),
     defaultJqlFilter: stringOrUndefined(process.env.JIRA_JQL_FILTER)
   };
@@ -547,6 +1109,247 @@ function normalizeFieldList(value, fallback) {
   return fields.length > 0 ? fields : fallback;
 }
 
+async function previewOrExecuteWrite({ config, args, tokenPayload, preview, execute }) {
+  if (args.dryRun !== false) {
+    return jsonContent(preview);
+  }
+
+  const confirmationToken = requiredString(args.confirmationToken, "confirmationToken");
+  verifyConfirmationToken(config, confirmationToken, tokenPayload);
+  const result = await execute();
+
+  return jsonContent({
+    executed: true,
+    dryRun: false,
+    result
+  });
+}
+
+function buildTokenPayload({ operation, method, endpointPath, target, payload, auditComment }) {
+  return {
+    operation,
+    method,
+    endpointPath,
+    target,
+    payload,
+    auditComment: auditComment ?? null
+  };
+}
+
+function buildWritePreview(config, tokenPayload, extras = {}) {
+  const confirmationToken = createConfirmationToken(config, tokenPayload);
+  const issuedAt = parseConfirmationToken(confirmationToken).issuedAt;
+
+  return {
+    dryRun: true,
+    operation: tokenPayload.operation,
+    method: tokenPayload.method,
+    endpointPath: tokenPayload.endpointPath,
+    target: extras.target ?? tokenPayload.target,
+    summary: extras.summary ?? null,
+    transitionId: extras.transitionId ?? null,
+    payloadSha256: sha256Hex(stableStringify(tokenPayload.payload)),
+    auditCommentSha256: tokenPayload.auditComment
+      ? sha256Hex(tokenPayload.auditComment)
+      : null,
+    confirmationToken,
+    expiresAt: new Date(
+      (issuedAt + CONFIRMATION_TOKEN_TTL_SECONDS) * 1000
+    ).toISOString()
+  };
+}
+
+function createConfirmationToken(config, tokenPayload, issuedAt = currentEpochSeconds()) {
+  const hmacInput = stableStringify({ issuedAt, tokenPayload });
+  const hmacHex = createHmac("sha256", config.authSecret)
+    .update(hmacInput)
+    .digest("hex");
+
+  return `v1.${issuedAt}.${hmacHex}`;
+}
+
+function verifyConfirmationToken(config, token, tokenPayload) {
+  const parsed = parseConfirmationToken(token);
+  const ageSeconds = currentEpochSeconds() - parsed.issuedAt;
+  if (ageSeconds < 0 || ageSeconds > CONFIRMATION_TOKEN_TTL_SECONDS) {
+    throw new Error("confirmationToken is expired");
+  }
+
+  const expected = createConfirmationToken(config, tokenPayload, parsed.issuedAt);
+  if (!constantTimeEqual(token, expected)) {
+    throw new Error("confirmationToken does not match this write operation");
+  }
+}
+
+function parseConfirmationToken(token) {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[0] !== "v1") {
+    throw new Error("confirmationToken is invalid");
+  }
+
+  const issuedAt = Number.parseInt(parts[1], 10);
+  if (!Number.isFinite(issuedAt) || issuedAt <= 0 || !/^[a-f0-9]{64}$/i.test(parts[2])) {
+    throw new Error("confirmationToken is invalid");
+  }
+
+  return { issuedAt };
+}
+
+function stableStringify(value) {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+    .join(",")}}`;
+}
+
+function constantTimeEqual(left, right) {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+  return timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function currentEpochSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function currentDateString() {
+  return new Date(Date.now()).toISOString().slice(0, 10);
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function buildCommonIssueFields(args) {
+  const fields = {};
+  const summary = stringOrUndefined(args.summary);
+  const description = stringOrUndefined(args.description);
+  const priority = stringOrUndefined(args.priority);
+  const labels = normalizeStringArray(args.labels);
+  const components = normalizeNameList(args.components);
+  const fixVersions = normalizeNameList(args.fixVersions);
+  const assignee = normalizeAssignee(args.assignee);
+
+  if (summary !== undefined) {
+    fields.summary = summary;
+  }
+  if (description !== undefined) {
+    fields.description = description;
+  }
+  if (priority) {
+    fields.priority = { name: priority };
+  }
+  if (assignee) {
+    fields.assignee = assignee;
+  }
+  if (labels) {
+    fields.labels = labels;
+  }
+  if (components) {
+    fields.components = components;
+  }
+  if (fixVersions) {
+    fields.fixVersions = fixVersions;
+  }
+
+  return fields;
+}
+
+function normalizeAssignee(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const name = stringOrUndefined(value.name);
+  const accountId = stringOrUndefined(value.accountId);
+  if (accountId) {
+    return { accountId };
+  }
+  if (name) {
+    return { name };
+  }
+  return null;
+}
+
+function normalizeStringArray(value) {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  const items = value
+    .map((item) => stringOrUndefined(item))
+    .filter((item) => item);
+  return items.length > 0 ? items : [];
+}
+
+function normalizeNameList(value) {
+  const items = normalizeStringArray(value);
+  return items ? items.map((name) => ({ name })) : null;
+}
+
+function objectOrUndefined(value, fieldName) {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  return value;
+}
+
+function addUniqueLabel(labels, label) {
+  const normalized = Array.isArray(labels) ? labels.slice() : [];
+  if (!normalized.includes(label)) {
+    normalized.push(label);
+  }
+  return normalized;
+}
+
+function appendDescriptionFooter(description, footer) {
+  if (description === undefined || description === null || description === "") {
+    return footer;
+  }
+  if (typeof description !== "string") {
+    return description;
+  }
+  return `${description.trim()}\n\n${footer}`;
+}
+
+function appendCommentFooter(body, footer) {
+  return `${body.trim()}\n\n${footer}`;
+}
+
+function appendUpdateComment(update, body) {
+  const nextUpdate = update ? { ...update } : {};
+  const comments = Array.isArray(nextUpdate.comment) ? nextUpdate.comment.slice() : [];
+  comments.push({ add: { body } });
+  nextUpdate.comment = comments;
+  return nextUpdate;
+}
+
+async function postJiraComment(config, issueKey, body) {
+  const data = await jiraRequest(
+    config,
+    `/issue/${encodeURIComponent(issueKey)}/comment`,
+    {
+      method: "POST",
+      body: { body }
+    }
+  );
+  return normalizeComment(data);
+}
+
 async function jiraRequest(config, endpointPath, options = {}) {
   const url = new URL(`${config.apiPath}${endpointPath}`, config.baseUrl);
   const queryParams = options.queryParams ?? {};
@@ -583,17 +1386,43 @@ async function jiraRequest(config, endpointPath, options = {}) {
   const parsedBody = tryParseJson(rawText);
 
   if (!response.ok) {
-    const detail =
-      parsedBody?.errorMessages?.join("; ") ??
-      parsedBody?.message ??
-      parsedBody?.error ??
-      rawText.slice(0, 1000);
+    const detail = extractJiraErrorDetail(parsedBody, rawText);
     throw new Error(
       `Jira request failed (${response.status} ${response.statusText}): ${detail}`
     );
   }
 
   return parsedBody ?? {};
+}
+
+function extractJiraErrorDetail(parsedBody, rawText) {
+  const details = [];
+
+  if (Array.isArray(parsedBody?.errorMessages)) {
+    details.push(...parsedBody.errorMessages.filter((message) => message));
+  }
+
+  if (parsedBody?.errors && typeof parsedBody.errors === "object") {
+    for (const [field, message] of Object.entries(parsedBody.errors)) {
+      if (message) {
+        details.push(`${field}: ${message}`);
+      }
+    }
+  }
+
+  if (typeof parsedBody?.message === "string" && parsedBody.message) {
+    details.push(parsedBody.message);
+  }
+
+  if (typeof parsedBody?.error === "string" && parsedBody.error) {
+    details.push(parsedBody.error);
+  }
+
+  if (details.length > 0) {
+    return details.join("; ");
+  }
+
+  return rawText ? rawText.slice(0, 1000) : "No error details returned by Jira";
 }
 
 function normalizeIssue(baseUrl, issue, options = {}) {
@@ -624,6 +1453,66 @@ function normalizeIssue(baseUrl, issue, options = {}) {
     normalized.description = normalizeDescription(fields.description);
   }
 
+  return normalized;
+}
+
+function normalizeWriteIssueResult(baseUrl, issue) {
+  if (issue?.fields) {
+    return normalizeIssue(baseUrl, issue, { includeDescription: true });
+  }
+
+  return {
+    id: issue?.id ?? null,
+    key: issue?.key ?? null,
+    url: issue?.key ? buildIssueUrl(baseUrl, issue.key) : null,
+    apiUrl: issue?.self ?? null
+  };
+}
+
+function normalizeMutationResult(baseUrl, issueKey, extras = {}) {
+  return {
+    issueKey,
+    url: buildIssueUrl(baseUrl, issueKey),
+    transitionId: extras.transitionId ?? null,
+    comment: extras.comment ?? null,
+    auditComment: extras.auditComment ?? null
+  };
+}
+
+function normalizeComment(comment) {
+  if (!comment || typeof comment !== "object") {
+    return null;
+  }
+
+  return {
+    id: comment.id ?? null,
+    author: normalizeUser(comment.author),
+    created: comment.created ?? null,
+    updated: comment.updated ?? null,
+    body: typeof comment.body === "string" ? comment.body : null,
+    apiUrl: comment.self ?? null
+  };
+}
+
+function normalizeTransitionFields(fields) {
+  if (!fields || typeof fields !== "object") {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [key, field] of Object.entries(fields)) {
+    normalized[key] = {
+      required: field?.required ?? null,
+      name: field?.name ?? null,
+      schema: field?.schema ?? null,
+      allowedValues: Array.isArray(field?.allowedValues)
+        ? field.allowedValues.map((value) => ({
+            id: value.id ?? null,
+            name: value.name ?? value.value ?? null
+          }))
+        : []
+    };
+  }
   return normalized;
 }
 
@@ -715,6 +1604,14 @@ function stringOrUndefined(value) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function requiredString(value, fieldName) {
+  const normalized = stringOrUndefined(value);
+  if (!normalized) {
+    throw new Error(`${fieldName} is required`);
+  }
+  return normalized;
+}
+
 function jsonContent(value) {
   return {
     content: [
@@ -786,4 +1683,8 @@ function logError(message, error, context) {
   if (context) {
     process.stderr.write(`[jira-mcp] context: ${context}\n`);
   }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  startStdioServer();
 }

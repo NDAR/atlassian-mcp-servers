@@ -59,6 +59,47 @@ test("create page dry-run returns a preview without writing", async () => {
   assert.match(preview.confirmationToken, /^v1\.\d+\.[a-f0-9]{64}$/);
 });
 
+test("create page wraps generated metadata intro in quote format", async () => {
+  const fetchCalls = [];
+  global.fetch = async (url, options) => {
+    fetchCalls.push({ url: url.toString(), options });
+    return jsonResponse(pageResponse({ id: "123", title: "Generated Page", version: 1 }));
+  };
+
+  const bodyStorage =
+    "<h1>Generated Page</h1>" +
+    "<p><strong>Generated:</strong> 2026-06-26</p>" +
+    "<p><strong>Latest source snapshot found:</strong> Source Page.</p>" +
+    "<p><strong>Codex update:</strong> Added a current snapshot.</p>" +
+    "<h2>Details</h2><p>Body.</p>";
+
+  const preview = await callTool("confluence_create_page", {
+    spaceKey: "ENG",
+    title: "Generated Page",
+    bodyStorage
+  });
+  const token = parseToolJson(preview).confirmationToken;
+
+  await callTool("confluence_create_page", {
+    spaceKey: "ENG",
+    title: "Generated Page",
+    bodyStorage,
+    dryRun: false,
+    confirmationToken: token
+  });
+  const writeCall = fetchCalls.find((call) => call.options.method === "POST");
+  const requestBody = JSON.parse(writeCall.options.body);
+
+  assert.equal(
+    requestBody.body.storage.value,
+    "<h1>Generated Page</h1><blockquote>" +
+      "<p><strong>Generated:</strong> 2026-06-26</p>" +
+      "<p><strong>Latest source snapshot found:</strong> Source Page.</p>" +
+      "<p><strong>Codex update:</strong> Added a current snapshot.</p>" +
+      "</blockquote><h2>Details</h2><p>Body.</p>"
+  );
+});
+
 test("create page execute rejects missing, expired, and mismatched tokens", async () => {
   const fetchCalls = [];
   global.fetch = async (...args) => {
@@ -168,6 +209,48 @@ test("update page executes with next version number", async () => {
   assert.equal(requestBody.body.storage.value, "<p>Updated</p>");
   assert.equal(result.executed, true);
   assert.equal(result.result.version, 3);
+});
+
+test("update page wraps generated metadata intro in quote format", async () => {
+  const fetchCalls = [];
+  global.fetch = async (url, options) => {
+    fetchCalls.push({ url: url.toString(), options });
+    if (options.method === "PUT") {
+      return jsonResponse(pageResponse({ id: "123", title: "Existing", version: 3 }));
+    }
+    return jsonResponse(pageResponse({ id: "123", title: "Existing", version: 2 }));
+  };
+
+  const bodyStorage =
+    "<h1>Existing</h1>" +
+    "<p><strong>Generated:</strong> 2026-06-26</p>" +
+    "<p><strong>Codex update:</strong> Refreshed a status table.</p>" +
+    "<h2>Status</h2><p>Body.</p>";
+
+  const preview = await callTool("confluence_update_page", {
+    pageId: "123",
+    currentVersion: 2,
+    bodyStorage
+  });
+  const token = parseToolJson(preview).confirmationToken;
+
+  await callTool("confluence_update_page", {
+    pageId: "123",
+    currentVersion: 2,
+    bodyStorage,
+    dryRun: false,
+    confirmationToken: token
+  });
+  const writeCall = fetchCalls.find((call) => call.options.method === "PUT");
+  const requestBody = JSON.parse(writeCall.options.body);
+
+  assert.equal(
+    requestBody.body.storage.value,
+    "<h1>Existing</h1><blockquote>" +
+      "<p><strong>Generated:</strong> 2026-06-26</p>" +
+      "<p><strong>Codex update:</strong> Refreshed a status table.</p>" +
+      "</blockquote><h2>Status</h2><p>Body.</p>"
+  );
 });
 
 test("add comment executes with expected comment payload", async () => {

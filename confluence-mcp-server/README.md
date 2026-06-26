@@ -62,6 +62,18 @@ All write tools default to dry-run mode. A dry-run call returns a preview and a 
 
 The confirmation token is valid for 10 minutes and is tied to the exact operation, target, title/body, parent page, page version, and version message. If any write argument changes, the token is rejected.
 
+## Generated Page Metadata
+
+For generated pages and updates, include a short generated intro at the top of `bodyStorage`:
+
+```html
+<p><strong>Generated:</strong> 2026-06-26</p>
+<p><strong>Latest source snapshot found:</strong> Source page or report.</p>
+<p><strong>Codex update:</strong> Brief description of what Codex changed.</p>
+```
+
+When this standard intro appears at the start of the body, or immediately after an opening `<h1>`, the server wraps it in Confluence quote format (`<blockquote>...</blockquote>`) by default for both page creation and page updates. Bodies without the standard `Generated` and `Codex update` paragraphs are not changed.
+
 ### Create page
 
 Dry-run:
