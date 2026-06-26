@@ -1,4 +1,6 @@
 import { Buffer } from "node:buffer";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 const SERVER_INFO = {
   name: "confluence-mcp-server",
@@ -13,7 +15,9 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
   "2024-09-03"
 ];
 
-const TOOL_DEFINITIONS = [
+const CONFIRMATION_TOKEN_TTL_SECONDS = 600;
+
+export const TOOL_DEFINITIONS = [
   {
     name: "confluence_search",
     description: "Search Confluence pages by free-text query or raw CQL.",
@@ -64,22 +68,126 @@ const TOOL_DEFINITIONS = [
       required: ["pageId"],
       additionalProperties: false
     }
+  },
+  {
+    name: "confluence_create_page",
+    description: "Dry-run or create a Confluence page using storage-format XHTML.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spaceKey: {
+          type: "string",
+          description: "Confluence space key where the page will be created."
+        },
+        title: {
+          type: "string",
+          description: "Title for the new page."
+        },
+        bodyStorage: {
+          type: "string",
+          description: "Confluence storage-format XHTML body."
+        },
+        parentPageId: {
+          type: "string",
+          description: "Optional parent page ID."
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Default true. Set false to execute with a valid confirmationToken."
+        },
+        confirmationToken: {
+          type: "string",
+          description: "Token returned by a matching dry-run preview."
+        }
+      },
+      required: ["spaceKey", "title", "bodyStorage"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "confluence_update_page",
+    description: "Dry-run or update a Confluence page title/body using storage-format XHTML.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pageId: {
+          type: "string",
+          description: "Confluence page ID."
+        },
+        currentVersion: {
+          type: "integer",
+          minimum: 1,
+          description: "Current page version from confluence_get_page."
+        },
+        title: {
+          type: "string",
+          description: "Optional replacement title. Defaults to current title."
+        },
+        bodyStorage: {
+          type: "string",
+          description: "Optional replacement storage-format XHTML body. Defaults to current body."
+        },
+        versionMessage: {
+          type: "string",
+          description: "Optional version comment/message."
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Default true. Set false to execute with a valid confirmationToken."
+        },
+        confirmationToken: {
+          type: "string",
+          description: "Token returned by a matching dry-run preview."
+        }
+      },
+      required: ["pageId", "currentVersion"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "confluence_add_comment",
+    description: "Dry-run or add a comment to a Confluence page using storage-format XHTML.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pageId: {
+          type: "string",
+          description: "Confluence page ID to comment on."
+        },
+        bodyStorage: {
+          type: "string",
+          description: "Confluence storage-format XHTML comment body."
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Default true. Set false to execute with a valid confirmationToken."
+        },
+        confirmationToken: {
+          type: "string",
+          description: "Token returned by a matching dry-run preview."
+        }
+      },
+      required: ["pageId", "bodyStorage"],
+      additionalProperties: false
+    }
   }
 ];
 
 let inputBuffer = Buffer.alloc(0);
 let outputMode = "line";
 
-process.stdin.on("data", (chunk) => {
-  inputBuffer = Buffer.concat([inputBuffer, chunk]);
-  processIncomingMessages().catch((error) => {
-    logError("failed to process incoming message", error);
+export function startStdioServer() {
+  process.stdin.on("data", (chunk) => {
+    inputBuffer = Buffer.concat([inputBuffer, chunk]);
+    processIncomingMessages().catch((error) => {
+      logError("failed to process incoming message", error);
+    });
   });
-});
 
-process.stdin.on("end", () => {
-  process.exit(0);
-});
+  process.stdin.on("end", () => {
+    process.exit(0);
+  });
+}
 
 async function processIncomingMessages() {
   while (true) {
@@ -248,7 +356,7 @@ function handleInitialize(params) {
   };
 }
 
-async function handleToolCall(params) {
+export async function handleToolCall(params) {
   const toolName = params.name;
   const args = params.arguments ?? {};
 
@@ -257,6 +365,12 @@ async function handleToolCall(params) {
       return await runToolSafely(() => confluenceSearch(args));
     case "confluence_get_page":
       return await runToolSafely(() => confluenceGetPage(args));
+    case "confluence_create_page":
+      return await runToolSafely(() => confluenceCreatePage(args));
+    case "confluence_update_page":
+      return await runToolSafely(() => confluenceUpdatePage(args));
+    case "confluence_add_comment":
+      return await runToolSafely(() => confluenceAddComment(args));
     default:
       return toolError(`Unknown tool: ${toolName}`);
   }
@@ -284,9 +398,11 @@ async function confluenceSearch(args) {
   });
 
   const data = await confluenceRequest(config, "/content/search", {
-    cql,
-    limit: String(limit),
-    expand: "space,version"
+    queryParams: {
+      cql,
+      limit: String(limit),
+      expand: "space,version"
+    }
   });
 
   const results = Array.isArray(data.results) ? data.results : [];
@@ -300,22 +416,11 @@ async function confluenceSearch(args) {
     excerpt: extractExcerpt(item)
   }));
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(
-          {
-            cql,
-            count: normalized.length,
-            results: normalized
-          },
-          null,
-          2
-        )
-      }
-    ]
-  };
+  return jsonContent({
+    cql,
+    count: normalized.length,
+    results: normalized
+  });
 }
 
 async function confluenceGetPage(args) {
@@ -329,34 +434,334 @@ async function confluenceGetPage(args) {
   const data = await confluenceRequest(
     config,
     `/content/${encodeURIComponent(pageId)}`,
-    { expand }
+    {
+      queryParams: { expand }
+    }
   );
 
-  const page = {
-    id: data.id ?? null,
-    title: data.title ?? null,
-    type: data.type ?? null,
-    spaceKey: data.space?.key ?? null,
-    version: data.version?.number ?? null,
-    lastUpdated: data.version?.when ?? null,
-    url: buildContentUrl(config.baseUrl, data._links),
-    ancestors: Array.isArray(data.ancestors)
-      ? data.ancestors.map((ancestor) => ({
-          id: ancestor.id ?? null,
-          title: ancestor.title ?? null
-        }))
-      : [],
-    bodyStorage: data.body?.storage?.value ?? null
+  return jsonContent(normalizePage(config, data));
+}
+
+async function confluenceCreatePage(args) {
+  const config = readConfig();
+  const spaceKey = requiredString(args.spaceKey, "spaceKey");
+  const title = requiredString(args.title, "title");
+  const bodyStorage = requiredString(args.bodyStorage, "bodyStorage");
+  const parentPageId = stringOrUndefined(args.parentPageId);
+  const payload = buildCreatePagePayload({ spaceKey, title, bodyStorage, parentPageId });
+  const tokenPayload = {
+    operation: "confluence_create_page",
+    method: "POST",
+    endpointPath: "/content",
+    spaceKey,
+    title,
+    bodyStorage,
+    parentPageId: parentPageId ?? null
+  };
+  const preview = buildWritePreview(config, tokenPayload, {
+    target: { spaceKey, parentPageId: parentPageId ?? null },
+    version: null
+  });
+
+  return await previewOrExecuteWrite({
+    config,
+    args,
+    tokenPayload,
+    preview,
+    execute: async () => {
+      const data = await confluenceRequest(config, "/content", {
+        method: "POST",
+        body: payload,
+        queryParams: { expand: "space,version" }
+      });
+      return normalizeWriteResult(config, data);
+    }
+  });
+}
+
+async function confluenceUpdatePage(args) {
+  const config = readConfig();
+  const pageId = requiredString(args.pageId, "pageId");
+  const currentVersion = requiredPositiveInteger(args.currentVersion, "currentVersion");
+  const nextTitle = stringOrUndefined(args.title);
+  const nextBodyStorage = stringOrUndefined(args.bodyStorage);
+  const versionMessage = stringOrUndefined(args.versionMessage);
+
+  if (!nextTitle && !nextBodyStorage) {
+    throw new Error("Either title or bodyStorage must be provided");
+  }
+
+  const currentPage = await fetchCurrentPageForUpdate(config, pageId);
+  assertCurrentVersion(currentPage, currentVersion);
+
+  const title = nextTitle ?? currentPage.title;
+  const bodyStorage = nextBodyStorage ?? currentPage.bodyStorage;
+  if (!title) {
+    throw new Error("Current page title is unavailable; title is required");
+  }
+  if (!bodyStorage) {
+    throw new Error("Current page body is unavailable; bodyStorage is required");
+  }
+
+  const payload = buildUpdatePagePayload({
+    title,
+    bodyStorage,
+    nextVersion: currentVersion + 1,
+    versionMessage
+  });
+  const endpointPath = `/content/${encodeURIComponent(pageId)}`;
+  const tokenPayload = {
+    operation: "confluence_update_page",
+    method: "PUT",
+    endpointPath,
+    pageId,
+    currentVersion,
+    nextVersion: currentVersion + 1,
+    title,
+    bodyStorage,
+    versionMessage: versionMessage ?? null
+  };
+  const preview = buildWritePreview(config, tokenPayload, {
+    target: { pageId },
+    version: {
+      current: currentVersion,
+      next: currentVersion + 1
+    }
+  });
+
+  return await previewOrExecuteWrite({
+    config,
+    args,
+    tokenPayload,
+    preview,
+    execute: async () => {
+      const latestPage = await fetchCurrentPageForUpdate(config, pageId);
+      assertCurrentVersion(latestPage, currentVersion);
+      const data = await confluenceRequest(config, endpointPath, {
+        method: "PUT",
+        body: payload,
+        queryParams: { expand: "space,version" }
+      });
+      return normalizeWriteResult(config, data);
+    }
+  });
+}
+
+async function confluenceAddComment(args) {
+  const config = readConfig();
+  const pageId = requiredString(args.pageId, "pageId");
+  const bodyStorage = requiredString(args.bodyStorage, "bodyStorage");
+  const payload = buildAddCommentPayload({ pageId, bodyStorage });
+  const tokenPayload = {
+    operation: "confluence_add_comment",
+    method: "POST",
+    endpointPath: "/content",
+    pageId,
+    bodyStorage
+  };
+  const preview = buildWritePreview(config, tokenPayload, {
+    target: { pageId },
+    version: null
+  });
+
+  return await previewOrExecuteWrite({
+    config,
+    args,
+    tokenPayload,
+    preview,
+    execute: async () => {
+      const data = await confluenceRequest(config, "/content", {
+        method: "POST",
+        body: payload,
+        queryParams: { expand: "space,version" }
+      });
+      return normalizeWriteResult(config, data);
+    }
+  });
+}
+
+async function previewOrExecuteWrite({ config, args, tokenPayload, preview, execute }) {
+  if (args.dryRun !== false) {
+    return jsonContent(preview);
+  }
+
+  const confirmationToken = requiredString(args.confirmationToken, "confirmationToken");
+  verifyConfirmationToken(config, confirmationToken, tokenPayload);
+  const result = await execute();
+
+  return jsonContent({
+    executed: true,
+    dryRun: false,
+    result
+  });
+}
+
+function buildCreatePagePayload({ spaceKey, title, bodyStorage, parentPageId }) {
+  const payload = {
+    type: "page",
+    title,
+    space: {
+      key: spaceKey
+    },
+    body: {
+      storage: {
+        value: bodyStorage,
+        representation: "storage"
+      }
+    }
   };
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(page, null, 2)
+  if (parentPageId) {
+    payload.ancestors = [{ id: parentPageId }];
+  }
+
+  return payload;
+}
+
+function buildUpdatePagePayload({ title, bodyStorage, nextVersion, versionMessage }) {
+  const payload = {
+    type: "page",
+    title,
+    version: {
+      number: nextVersion
+    },
+    body: {
+      storage: {
+        value: bodyStorage,
+        representation: "storage"
       }
-    ]
+    }
   };
+
+  if (versionMessage) {
+    payload.version.message = versionMessage;
+  }
+
+  return payload;
+}
+
+function buildAddCommentPayload({ pageId, bodyStorage }) {
+  return {
+    type: "comment",
+    container: {
+      id: pageId,
+      type: "page"
+    },
+    body: {
+      storage: {
+        value: bodyStorage,
+        representation: "storage"
+      }
+    }
+  };
+}
+
+async function fetchCurrentPageForUpdate(config, pageId) {
+  const data = await confluenceRequest(
+    config,
+    `/content/${encodeURIComponent(pageId)}`,
+    {
+      queryParams: { expand: "body.storage,space,version" }
+    }
+  );
+  return normalizePage(config, data);
+}
+
+function assertCurrentVersion(page, expectedVersion) {
+  if (page.version !== expectedVersion) {
+    throw new Error(
+      `Page version mismatch for ${page.id}: expected ${expectedVersion}, found ${page.version}`
+    );
+  }
+}
+
+function buildWritePreview(config, tokenPayload, extras) {
+  const confirmationToken = createConfirmationToken(config, tokenPayload);
+  const issuedAt = parseConfirmationToken(confirmationToken).issuedAt;
+
+  return {
+    dryRun: true,
+    operation: tokenPayload.operation,
+    method: tokenPayload.method,
+    endpointPath: tokenPayload.endpointPath,
+    target: extras.target,
+    title: tokenPayload.title ?? null,
+    version: extras.version,
+    bodyLength: tokenPayload.bodyStorage.length,
+    bodySha256: sha256Hex(tokenPayload.bodyStorage),
+    confirmationToken,
+    expiresAt: new Date(
+      (issuedAt + CONFIRMATION_TOKEN_TTL_SECONDS) * 1000
+    ).toISOString()
+  };
+}
+
+function createConfirmationToken(config, tokenPayload, issuedAt = currentEpochSeconds()) {
+  const hmacInput = stableStringify({ issuedAt, tokenPayload });
+  const hmacHex = createHmac("sha256", config.authSecret)
+    .update(hmacInput)
+    .digest("hex");
+
+  return `v1.${issuedAt}.${hmacHex}`;
+}
+
+function verifyConfirmationToken(config, token, tokenPayload) {
+  const parsed = parseConfirmationToken(token);
+  const ageSeconds = currentEpochSeconds() - parsed.issuedAt;
+  if (ageSeconds < 0 || ageSeconds > CONFIRMATION_TOKEN_TTL_SECONDS) {
+    throw new Error("confirmationToken is expired");
+  }
+
+  const expected = createConfirmationToken(config, tokenPayload, parsed.issuedAt);
+  if (!constantTimeEqual(token, expected)) {
+    throw new Error("confirmationToken does not match this write operation");
+  }
+}
+
+function parseConfirmationToken(token) {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[0] !== "v1") {
+    throw new Error("confirmationToken is invalid");
+  }
+
+  const issuedAt = Number.parseInt(parts[1], 10);
+  if (!Number.isFinite(issuedAt) || issuedAt <= 0 || !/^[a-f0-9]{64}$/i.test(parts[2])) {
+    throw new Error("confirmationToken is invalid");
+  }
+
+  return { issuedAt };
+}
+
+function stableStringify(value) {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+    .join(",")}}`;
+}
+
+function constantTimeEqual(left, right) {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+  return timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function currentEpochSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function readConfig() {
@@ -398,6 +803,7 @@ function readConfig() {
     email,
     apiToken,
     bearerToken: token,
+    authSecret: authMode === "basic" ? password ?? apiToken : token,
     defaultSpaceKey: stringOrUndefined(process.env.CONFLUENCE_SPACE_KEY),
     defaultCqlFilter: stringOrUndefined(process.env.CONFLUENCE_CQL_FILTER)
   };
@@ -453,10 +859,18 @@ function escapeCqlString(value) {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-async function confluenceRequest(config, endpointPath, queryParams = {}) {
+async function confluenceRequest(config, endpointPath, options = {}) {
   const url = new URL(`${config.apiPath}${endpointPath}`, config.baseUrl);
+  const queryParams = options.queryParams ?? options;
   for (const [key, value] of Object.entries(queryParams)) {
-    if (value !== undefined && value !== null && value !== "") {
+    if (
+      key !== "method" &&
+      key !== "body" &&
+      key !== "queryParams" &&
+      value !== undefined &&
+      value !== null &&
+      value !== ""
+    ) {
       url.searchParams.set(key, value);
     }
   }
@@ -464,6 +878,10 @@ async function confluenceRequest(config, endpointPath, queryParams = {}) {
   const headers = {
     Accept: "application/json"
   };
+
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
 
   if (config.authMode === "basic") {
     const basicUser = config.username ?? config.email;
@@ -475,7 +893,11 @@ async function confluenceRequest(config, endpointPath, queryParams = {}) {
     headers.Authorization = `Bearer ${config.bearerToken}`;
   }
 
-  const response = await fetch(url, { headers });
+  const response = await fetch(url, {
+    method: options.method ?? "GET",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body)
+  });
   const rawText = await response.text();
   const parsedBody = tryParseJson(rawText);
 
@@ -503,6 +925,36 @@ function tryParseJson(value) {
   } catch {
     return null;
   }
+}
+
+function normalizePage(config, data) {
+  return {
+    id: data.id ?? null,
+    title: data.title ?? null,
+    type: data.type ?? null,
+    spaceKey: data.space?.key ?? null,
+    version: data.version?.number ?? null,
+    lastUpdated: data.version?.when ?? null,
+    url: buildContentUrl(config.baseUrl, data._links),
+    ancestors: Array.isArray(data.ancestors)
+      ? data.ancestors.map((ancestor) => ({
+          id: ancestor.id ?? null,
+          title: ancestor.title ?? null
+        }))
+      : [],
+    bodyStorage: data.body?.storage?.value ?? null
+  };
+}
+
+function normalizeWriteResult(config, data) {
+  return {
+    id: data.id ?? null,
+    title: data.title ?? null,
+    type: data.type ?? null,
+    version: data.version?.number ?? null,
+    spaceKey: data.space?.key ?? null,
+    url: buildContentUrl(config.baseUrl, data._links)
+  };
 }
 
 function extractExcerpt(item) {
@@ -558,8 +1010,35 @@ function clampInteger(value, defaultValue, min, max) {
   return Math.min(max, Math.max(min, numeric));
 }
 
+function requiredPositiveInteger(value, name) {
+  const numeric = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(numeric) || numeric < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return numeric;
+}
+
+function requiredString(value, name) {
+  const normalized = stringOrUndefined(value);
+  if (!normalized) {
+    throw new Error(`${name} is required`);
+  }
+  return normalized;
+}
+
 function stringOrUndefined(value) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function jsonContent(value) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(value, null, 2)
+      }
+    ]
+  };
 }
 
 function toolError(message) {
@@ -622,4 +1101,12 @@ function logError(message, error, context) {
   if (context) {
     process.stderr.write(`[confluence-mcp] context: ${context}\n`);
   }
+}
+
+function isMainModule() {
+  return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+}
+
+if (isMainModule()) {
+  startStdioServer();
 }
