@@ -11,54 +11,37 @@ Each server is dependency-free and uses Node's built-in `fetch`.
 
 Both servers include write-capable tools. Write tools default to dry-run mode and require a second call with a matching `confirmationToken` before they create or update anything.
 
-## Codex Desktop Setup
+## Simple Codex Desktop Setup
 
-These steps add both MCP servers to Codex Desktop.
+These steps add both MCP servers and the Atlassian Codex skill to Codex Desktop.
 
-Choose the section for your operating system:
+You need:
 
-- [macOS or Linux](#macos-or-linux)
-- [Windows](#windows)
+- Codex Desktop
+- Node.js 18 or newer
+- Your Confluence base URL, such as `https://wiki.example.org`
+- Your Jira base URL, such as `https://jira.example.org`
+- One Confluence personal access token
+- One Jira personal access token
 
-You need one personal access token for Confluence and one personal access token for Jira.
-
-Keep these private. Do not paste them into GitHub, Slack, email, tickets, or screenshots.
-
-In the examples below, replace these placeholders with your real values:
-
-```text
-PASTE_YOUR_CONFLUENCE_PAT_HERE
-PASTE_YOUR_JIRA_PAT_HERE
-```
-
-## macOS or Linux
+Keep your tokens private. Do not paste them into GitHub, Slack, email, tickets, or screenshots.
 
 ### 1. Install Node.js
 
-These servers require Node.js 18 or newer.
-
-Check whether Node is already installed:
+Check whether Node.js is already installed:
 
 ```bash
 node --version
 ```
 
-If the command prints a version like `v18.x`, `v20.x`, or `v22.x`, continue to the next step.
+If it prints `v18.x`, `v20.x`, `v22.x`, or newer, continue.
 
-If Node is not installed, install it with Homebrew:
+If Node.js is not installed:
 
-```bash
-brew install node
-```
+- macOS: install Node.js from `https://nodejs.org/`, or run `brew install node` if you use Homebrew.
+- Windows: install the LTS version from `https://nodejs.org/`.
 
-Then check again:
-
-```bash
-node --version
-which node
-```
-
-Keep the path printed by `which node`. You will use it as the `command` value in `config.toml`.
+After installing Node.js, close and reopen Terminal or PowerShell, then run `node --version` again.
 
 ### 2. Download This Repository
 
@@ -70,95 +53,25 @@ git clone https://github.com/NDAR/mcp-servers.git
 
 If you do not use Git, download the repository ZIP from GitHub and unzip it.
 
-In the examples below, replace:
+### 3. Run The Installer
 
-```text
-/path/to/mcp-servers
-```
-
-with the folder where you put this repository.
-
-For example, if this file is at:
-
-```text
-/Users/alex/Documents/mcp-servers/README.md
-```
-
-then your folder path is:
-
-```text
-/Users/alex/Documents/mcp-servers
-```
-
-### 3. Open Codex Config
-
-Codex Desktop reads MCP server settings from:
-
-```text
-~/.codex/config.toml
-```
-
-On macOS, you can open it from Terminal with:
+Open Terminal or PowerShell in the repository folder and run:
 
 ```bash
-open -e ~/.codex/config.toml
+node install-codex-atlassian-mcp.mjs
 ```
 
-If the file does not exist yet, create it:
+The installer will ask for your Confluence URL, Jira URL, Confluence token, and Jira token. It will then:
 
-```bash
-mkdir -p ~/.codex
-touch ~/.codex/config.toml
-open -e ~/.codex/config.toml
-```
+- update `~/.codex/config.toml`
+- create a backup of your previous config
+- install the `nda-atlassian` Codex skill
 
-### 4. Add The MCP Server Entries
+### 4. Restart Codex
 
-Add these sections to `~/.codex/config.toml`.
+Quit and reopen Codex Desktop.
 
-Use the path from `which node` for `command`. Common values are `/usr/local/bin/node` on Intel Macs and `/opt/homebrew/bin/node` on Apple Silicon Macs.
-
-Replace `/path/to/mcp-servers` with your repository folder path.
-
-Replace only the two PAT placeholder values with your real tokens.
-
-```toml
-[mcp_servers.confluence]
-enabled = true
-command = "/usr/local/bin/node"
-args = ["--use-system-ca", "/path/to/mcp-servers/confluence-mcp-server/src/server.mjs"]
-
-[mcp_servers.confluence.env]
-CONFLUENCE_AUTH_MODE = "bearer"
-CONFLUENCE_BASE_URL = "PASTE_CONFLUENCE_URL_HERE"
-CONFLUENCE_API_PATH = "/rest/api"
-CONFLUENCE_PAT = "PASTE_YOUR_CONFLUENCE_PAT_HERE"
-
-[mcp_servers.jira]
-enabled = true
-command = "/usr/local/bin/node"
-args = ["--use-system-ca", "/path/to/mcp-servers/jira-mcp-server/src/server.mjs"]
-
-[mcp_servers.jira.env]
-JIRA_AUTH_MODE = "bearer"
-JIRA_BASE_URL = "PASTE_JIRA_URL_HERE"
-JIRA_API_PATH = "/rest/api/2"
-JIRA_PAT = "PASTE_YOUR_JIRA_PAT_HERE"
-```
-
-If `which node` printed a different path, update both `command` lines. For example:
-
-```toml
-command = "/opt/homebrew/bin/node"
-```
-
-### 5. Restart Codex
-
-Quit and reopen Codex Desktop after saving `config.toml`.
-
-### 6. Confirm Codex Can See The Servers
-
-In Terminal, run:
+Optional: confirm the servers are visible:
 
 ```bash
 codex mcp list
@@ -173,223 +86,47 @@ jira
 
 Both should show `enabled`.
 
-### 7. Try The Tools In Codex
+### 5. Try It
 
-After restarting Codex, ask it to use the Confluence or Jira MCP server. For example:
-
-```text
-Search Confluence for NDA data dictionary
-```
+Ask Codex:
 
 ```text
-Search Jira for unresolved issues mentioning validation
-```
-
-## Windows
-
-### 1. Install Node.js
-
-These servers require Node.js 18 or newer.
-
-Open PowerShell and check whether Node is already installed:
-
-```powershell
-node --version
-```
-
-If the command prints a version like `v18.x`, `v20.x`, or `v22.x`, continue to the next step.
-
-If Node is not installed, download and install the LTS version from:
-
-```text
-https://nodejs.org/
-```
-
-After installing Node, close PowerShell, open it again, and run:
-
-```powershell
-node --version
-where.exe node
-```
-
-Keep the path printed by `where.exe node`. You will use it as the `command` value in `config.toml`.
-
-Most Windows installs use:
-
-```text
-C:\Program Files\nodejs\node.exe
-```
-
-In `config.toml`, write Windows paths with forward slashes:
-
-```text
-C:/Program Files/nodejs/node.exe
-```
-
-### 2. Download This Repository
-
-Put this repository somewhere on your computer.
-
-If you use Git, run this in PowerShell:
-
-```powershell
-git clone https://github.com/NDAR/mcp-servers.git
-```
-
-If you do not use Git, download the repository ZIP from GitHub and unzip it.
-
-In the examples below, replace:
-
-```text
-C:/path/to/mcp-servers
-```
-
-with the folder where you put this repository.
-
-For example, if this file is at:
-
-```text
-C:\Users\alex\Documents\mcp-servers\README.md
-```
-
-then your folder path in `config.toml` should be:
-
-```text
-C:/Users/alex/Documents/mcp-servers
-```
-
-### 3. Open Codex Config
-
-Codex Desktop reads MCP server settings from:
-
-```text
-%USERPROFILE%\.codex\config.toml
-```
-
-Open it from PowerShell:
-
-```powershell
-notepad $env:USERPROFILE\.codex\config.toml
-```
-
-If the file does not exist yet, create it:
-
-```powershell
-New-Item -ItemType Directory -Force $env:USERPROFILE\.codex
-New-Item -ItemType File -Force $env:USERPROFILE\.codex\config.toml
-notepad $env:USERPROFILE\.codex\config.toml
-```
-
-### 4. Add The MCP Server Entries
-
-Add these sections to `%USERPROFILE%\.codex\config.toml`.
-
-Use the path from `where.exe node` for `command`. Replace backslashes with forward slashes.
-
-Replace `C:/path/to/mcp-servers` with your repository folder path.
-
-Replace only the two PAT placeholder values with your real tokens.
-
-```toml
-[mcp_servers.confluence]
-enabled = true
-command = "C:/Program Files/nodejs/node.exe"
-args = ["--use-system-ca", "C:/path/to/mcp-servers/confluence-mcp-server/src/server.mjs"]
-
-[mcp_servers.confluence.env]
-CONFLUENCE_AUTH_MODE = "bearer"
-CONFLUENCE_BASE_URL = "PASTE_CONFLUENCE_URL_HERE"
-CONFLUENCE_API_PATH = "/rest/api"
-CONFLUENCE_PAT = "PASTE_YOUR_CONFLUENCE_PAT_HERE"
-
-[mcp_servers.jira]
-enabled = true
-command = "C:/Program Files/nodejs/node.exe"
-args = ["--use-system-ca", "C:/path/to/mcp-servers/jira-mcp-server/src/server.mjs"]
-
-[mcp_servers.jira.env]
-JIRA_AUTH_MODE = "bearer"
-JIRA_BASE_URL = "PASTE_JIRA_URL_HERE"
-JIRA_API_PATH = "/rest/api/2"
-JIRA_PAT = "PASTE_YOUR_JIRA_PAT_HERE"
-```
-
-If `where.exe node` printed a different path, update both `command` lines. For example:
-
-```toml
-command = "C:/Users/alex/AppData/Local/Programs/nodejs/node.exe"
-```
-
-### 5. Restart Codex
-
-Quit and reopen Codex Desktop after saving `config.toml`.
-
-### 6. Confirm Codex Can See The Servers
-
-In PowerShell, run:
-
-```powershell
-codex mcp list
-```
-
-You should see both of these entries:
-
-```text
-confluence
-jira
-```
-
-Both should show `enabled`.
-
-### 7. Try The Tools In Codex
-
-After restarting Codex, ask it to use the Confluence or Jira MCP server. For example:
-
-```text
-Search Confluence for NDA data dictionary
+Search Confluence for the data dictionary
 ```
 
 ```text
 Search Jira for unresolved issues mentioning validation
+```
+
+```text
+What changed recently on the wiki?
 ```
 
 ## Troubleshooting
 
 If Codex does not show the servers, check these items:
 
-- `~/.codex/config.toml` on macOS/Linux or `%USERPROFILE%\.codex\config.toml` on Windows was saved after editing.
-- Codex Desktop was restarted after editing the file.
-- `command` points to the real Node path from `which node` on macOS/Linux or `where.exe node` on Windows.
-- `/path/to/mcp-servers` or `C:/path/to/mcp-servers` was replaced with the real repository folder path.
-- Both PAT values were replaced with real tokens.
+- Codex Desktop was restarted after running the installer.
+- `node --version` prints `v18.x` or newer.
+- `~/.codex/config.toml` contains `mcp_servers.confluence` and `mcp_servers.jira`.
+- The Confluence and Jira URLs were entered correctly.
+- Both PAT values were entered correctly.
 - The server files exist at:
-  - `/path/to/mcp-servers/confluence-mcp-server/src/server.mjs`
-  - `/path/to/mcp-servers/jira-mcp-server/src/server.mjs`
-  - `C:/path/to/mcp-servers/confluence-mcp-server/src/server.mjs`
-  - `C:/path/to/mcp-servers/jira-mcp-server/src/server.mjs`
+  - `confluence-mcp-server/src/server.mjs`
+  - `jira-mcp-server/src/server.mjs`
 
 You can test each server file directly:
 
 ```bash
-cd /path/to/mcp-servers/confluence-mcp-server
+cd confluence-mcp-server
 npm run check
+cd ..
 ```
 
 ```bash
-cd /path/to/mcp-servers/jira-mcp-server
+cd jira-mcp-server
 npm run check
-```
-
-On Windows, use PowerShell:
-
-```powershell
-cd C:/path/to/mcp-servers/confluence-mcp-server
-npm run check
-```
-
-```powershell
-cd C:/path/to/mcp-servers/jira-mcp-server
-npm run check
+cd ..
 ```
 
 The commands should finish without errors.

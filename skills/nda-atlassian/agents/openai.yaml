@@ -1,0 +1,4 @@
+interface:
+  display_name: "NDA Atlassian"
+  short_description: "Use NDA Confluence and Jira MCP servers."
+  default_prompt: "Use NDA Atlassian to search Confluence or Jira and summarize the result with links."
