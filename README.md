@@ -28,15 +28,25 @@ Keep your tokens private. Do not paste them into GitHub, Slack, email, tickets, 
 
 ### Windows Without Admin Rights
 
-If Windows does not allow you to install Node.js, use the PowerShell installer instead. It downloads a portable Node.js ZIP into your user profile and does not require admin rights.
+If Windows does not allow you to install Node.js, use one of the no-admin Windows installers. They download a portable Node.js ZIP into your user profile and do not require admin rights.
 
-Open PowerShell in this repository folder and run:
+If PowerShell is allowed, open PowerShell in this repository folder and run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install-codex-atlassian-mcp-windows.ps1
 ```
 
-If you only have the `.ps1` file, you can still run it. The installer will download the MCP server files from GitHub.
+If Cylance or another endpoint policy blocks PowerShell scripts, open Command Prompt in this repository folder and run:
+
+```bat
+install-codex-atlassian-mcp-windows.cmd
+```
+
+The Command Prompt installer does not use PowerShell. It uses built-in Windows `curl.exe` and `tar.exe` to download and extract portable Node.js, then runs the Node-based installer.
+
+If the Command Prompt installer is also blocked, contact desktop support and ask them to allow the installer or provide an approved local package. Endpoint tools can block all script-based installers, even when they do not require admin rights.
+
+If you only have the `.ps1` or `.cmd` file, you can still run it. The installer will download the MCP server files from GitHub.
 
 The installer will:
 
@@ -146,6 +156,7 @@ If Codex does not show the servers, check these items:
 - The server files exist at:
   - `confluence-mcp-server/src/server.mjs`
   - `jira-mcp-server/src/server.mjs`
+- On locked-down Windows laptops, if Cylance blocks PowerShell, use `install-codex-atlassian-mcp-windows.cmd` from Command Prompt.
 
 You can test each server file directly:
 
