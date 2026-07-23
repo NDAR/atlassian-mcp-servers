@@ -18,13 +18,45 @@ These steps add both MCP servers and the Atlassian Codex skill to Codex Desktop.
 You need:
 
 - Codex Desktop
-- Node.js 18 or newer
+- Node.js 18 or newer, unless you use the Windows no-admin installer below
 - Your Confluence base URL, such as `https://wiki.example.org`
 - Your Jira base URL, such as `https://jira.example.org`
 - One Confluence personal access token
 - One Jira personal access token
 
 Keep your tokens private. Do not paste them into GitHub, Slack, email, tickets, or screenshots.
+
+### Windows Without Admin Rights
+
+If Windows does not allow you to install Node.js, use the PowerShell installer instead. It downloads a portable Node.js ZIP into your user profile and does not require admin rights.
+
+Open PowerShell in this repository folder and run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-codex-atlassian-mcp-windows.ps1
+```
+
+If you only have the `.ps1` file, you can still run it. The installer will download the MCP server files from GitHub.
+
+The installer will:
+
+- install portable Node.js under `%LOCALAPPDATA%\NDAR\AtlassianMcp`
+- copy the MCP server files under `%LOCALAPPDATA%\NDAR\AtlassianMcp`
+- prompt for the Confluence URL, Jira URL, Confluence PAT, and Jira PAT
+- update `%USERPROFILE%\.codex\config.toml`
+- create a backup of the previous config
+- install the `nda-atlassian` Codex skill
+
+Use these NDA URLs when prompted:
+
+```text
+https://wiki.nimhda.org
+https://jira.nimhda.org
+```
+
+After the installer finishes, quit and reopen Codex Desktop.
+
+### macOS, Linux, Or Windows With Node.js
 
 ### 1. Install Node.js
 
@@ -48,7 +80,7 @@ After installing Node.js, close and reopen Terminal or PowerShell, then run `nod
 Put this repository somewhere on your computer. For example:
 
 ```bash
-git clone https://github.com/NDAR/mcp-servers.git
+git clone https://github.com/NDAR/atlassian-mcp-servers.git
 ```
 
 If you do not use Git, download the repository ZIP from GitHub and unzip it.
