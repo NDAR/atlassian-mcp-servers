@@ -32,6 +32,208 @@ test("tool list includes Confluence write tools", () => {
   assert.ok(toolNames.includes("confluence_add_comment"));
 });
 
+test("search wraps raw CQL with allowed spaces and blocked label filters", async () => {
+  process.env.CONFLUENCE_ALLOWED_SPACES = "NOR, PM";
+  const fetchCalls = [];
+  global.fetch = async (url, options) => {
+    fetchCalls.push({ url: url.toString(), options });
+    return jsonResponse({
+      results: [
+        pageResponse({ id: "1", title: "Allowed", version: 1, spaceKey: "NOR", labels: ["public"] }),
+        pageResponse({ id: "2", title: "Outside", version: 1, spaceKey: "ENG", labels: [] }),
+        pageResponse({ id: "3", title: "Sensitive", version: 1, spaceKey: "PM", labels: ["sensitive"] })
+      ]
+    });
+  };
+
+  const result = parseToolJson(await callTool("confluence_search", {
+    cql: 'title ~ "budget" ORDER BY lastmodified DESC',
+    limit: 10
+  }));
+  const requestUrl = new URL(fetchCalls[0].url);
+
+  assert.equal(
+    requestUrl.searchParams.get("cql"),
+    '(title ~ "budget") AND space in ("NOR", "PM") AND label not in ("sensitive", "restricted", "phi", "pii", "security") ORDER BY lastmodified DESC'
+  );
+  assert.equal(requestUrl.searchParams.get("expand"), "space,version,metadata.labels");
+  assert.equal(result.count, 1);
+  assert.equal(result.results[0].spaceKey, "NOR");
+});
+
+test("generated search rejects a requested space outside the allowlist", async () => {
+  process.env.CONFLUENCE_ALLOWED_SPACES = "NOR";
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    throw new Error("fetch should not be called");
+  };
+
+  const result = await callTool("confluence_search", {
+    query: "runbook",
+    spaceKey: "ENG"
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /CONFLUENCE_ALLOWED_SPACES/);
+  assert.equal(fetchCalls.length, 0);
+});
+
+test("get page rejects pages outside allowed spaces before returning body", async () => {
+  process.env.CONFLUENCE_ALLOWED_SPACES = "NOR";
+  global.fetch = async () => jsonResponse(
+    pageResponse({ id: "123", title: "Outside", version: 1, spaceKey: "ENG", body: "<p>secret</p>" })
+  );
+
+  const result = await callTool("confluence_get_page", { pageId: "123" });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /CONFLUENCE_ALLOWED_SPACES/);
+  assert.doesNotMatch(result.content[0].text, /secret/);
+});
+
+test("get page rejects blocked labels before returning body", async () => {
+  global.fetch = async () => jsonResponse(
+    pageResponse({ id: "123", title: "Sensitive", version: 1, labels: ["phi"], body: "<p>private</p>" })
+  );
+
+  const result = await callTool("confluence_get_page", { pageId: "123" });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /blocked label phi/);
+  assert.doesNotMatch(result.content[0].text, /private/);
+});
+
+test("get page rejects blocked ancestor labels before returning body", async () => {
+  const fetchCalls = [];
+  global.fetch = async (url) => {
+    fetchCalls.push(url.toString());
+    if (url.toString().includes("/content/parent")) {
+      return jsonResponse(
+        pageResponse({
+          id: "parent",
+          title: "Parent",
+          version: 1,
+          labels: ["restricted"],
+          body: "<p>parent private</p>"
+        })
+      );
+    }
+    return jsonResponse(
+      pageResponse({
+        id: "child",
+        title: "Child",
+        version: 1,
+        body: "<p>child private</p>",
+        ancestors: [{ id: "parent", title: "Parent" }]
+      })
+    );
+  };
+
+  const result = await callTool("confluence_get_page", { pageId: "child" });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /ancestor page parent has blocked label restricted/);
+  assert.doesNotMatch(result.content[0].text, /child private/);
+  assert.doesNotMatch(result.content[0].text, /parent private/);
+  assert.equal(fetchCalls.length, 2);
+});
+
+test("search filters pages with blocked ancestor labels", async () => {
+  const child = pageResponse({
+    id: "child",
+    title: "Child",
+    version: 1,
+    body: "<p>child private</p>"
+  });
+  delete child.ancestors;
+
+  global.fetch = async (url) => {
+    const textUrl = url.toString();
+    if (textUrl.includes("/content/search")) {
+      return jsonResponse({ results: [child] });
+    }
+    if (textUrl.includes("/content/child")) {
+      return jsonResponse(
+        pageResponse({
+          id: "child",
+          title: "Child",
+          version: 1,
+          ancestors: [{ id: "parent", title: "Parent" }]
+        })
+      );
+    }
+    if (textUrl.includes("/content/parent")) {
+      return jsonResponse(
+        pageResponse({
+          id: "parent",
+          title: "Parent",
+          version: 1,
+          labels: ["sensitive"],
+          body: "<p>parent private</p>"
+        })
+      );
+    }
+    throw new Error(`unexpected URL ${textUrl}`);
+  };
+
+  const result = parseToolJson(await callTool("confluence_search", {
+    query: "child"
+  }));
+
+  assert.equal(result.count, 0);
+  assert.deepEqual(result.results, []);
+});
+
+test("writes reject disallowed spaces and blocked target pages before preview", async () => {
+  process.env.CONFLUENCE_ALLOWED_SPACES = "NOR";
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return jsonResponse(
+      pageResponse({ id: "123", title: "Sensitive", version: 1, spaceKey: "NOR", labels: ["restricted"] })
+    );
+  };
+
+  const create = await callTool("confluence_create_page", {
+    spaceKey: "ENG",
+    title: "New Page",
+    bodyStorage: "<p>Hello</p>"
+  });
+  const update = await callTool("confluence_update_page", {
+    pageId: "123",
+    currentVersion: 1,
+    title: "Updated"
+  });
+
+  assert.equal(create.isError, true);
+  assert.match(create.content[0].text, /CONFLUENCE_ALLOWED_SPACES/);
+  assert.equal(update.isError, true);
+  assert.match(update.content[0].text, /blocked label restricted/);
+  assert.equal(fetchCalls.length, 1);
+});
+
+test("create page rejects blocked parent pages before preview", async () => {
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return jsonResponse(
+      pageResponse({ id: "parent", title: "Parent", version: 1, labels: ["security"] })
+    );
+  };
+
+  const result = await callTool("confluence_create_page", {
+    spaceKey: "ENG",
+    parentPageId: "parent",
+    title: "Child",
+    bodyStorage: "<p>Child</p>"
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /blocked label security/);
+  assert.equal(fetchCalls.length, 1);
+});
+
 test("create page dry-run returns a preview without writing", async () => {
   const fetchCalls = [];
   global.fetch = async (...args) => {
@@ -313,14 +515,28 @@ function jsonResponse(value, status = 200) {
   });
 }
 
-function pageResponse({ id, title, version, body = "<p>Existing</p>" }) {
+function pageResponse({
+  id,
+  title,
+  version,
+  body = "<p>Existing</p>",
+  spaceKey = "ENG",
+  labels = [],
+  ancestors = []
+}) {
   return {
     id,
     type: "page",
     title,
-    space: { key: "ENG" },
+    space: { key: spaceKey },
     version: { number: version, when: "2026-06-26T00:00:00.000Z" },
+    metadata: {
+      labels: {
+        results: labels.map((name) => ({ name }))
+      }
+    },
+    ancestors,
     body: { storage: { value: body } },
-    _links: { webui: `/display/ENG/${encodeURIComponent(title)}` }
+    _links: { webui: `/display/${spaceKey}/${encodeURIComponent(title)}` }
   };
 }

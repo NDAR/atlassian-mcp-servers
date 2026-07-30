@@ -32,8 +32,25 @@ Copy `.env.example` into your client-side environment configuration and set:
 - `CONFLUENCE_API_TOKEN`: Cloud API token
 - `CONFLUENCE_SPACE_KEY`: optional default space filter
 - `CONFLUENCE_CQL_FILTER`: optional CQL appended to generated searches
+- `CONFLUENCE_ALLOWED_SPACES`: optional comma-separated space allowlist enforced on all reads and writes, for example `NOR,PM,DEV`
+- `CONFLUENCE_BLOCKED_LABELS`: optional comma-separated labels to block. Defaults to `sensitive,restricted,phi,pii,security`
 
 The write tools do not use a separate enable flag. If the configured account can write in Confluence, the tools can write after their dry-run confirmation step.
+
+## Guardrails
+
+Use `CONFLUENCE_ALLOWED_SPACES` to limit the server to approved spaces. When it is set, every search, page fetch, page create, page update, and page comment is checked against that allowlist. Raw CQL is still allowed, but the server wraps it with a `space in (...)` condition so callers cannot bypass the allowlist.
+
+Pages with labels listed in `CONFLUENCE_BLOCKED_LABELS` are blocked. The server checks the page and its ancestor pages, requests labels before returning page bodies, and blocked pages return a tool error without body content.
+
+For Codex Desktop installs, set these under `[mcp_servers.confluence.env]` in `~/.codex/config.toml` on macOS/Linux or `%USERPROFILE%\.codex\config.toml` on Windows.
+
+NDA-safe example:
+
+```bash
+CONFLUENCE_ALLOWED_SPACES=NOR,PM,DEV
+CONFLUENCE_BLOCKED_LABELS=sensitive,restricted,phi,pii,security
+```
 
 ## Data Center Recommendation
 
@@ -165,7 +182,9 @@ Use whatever MCP client you have. The server expects environment variables to be
         "CONFLUENCE_API_PATH": "/rest/api",
         "CONFLUENCE_AUTH_MODE": "bearer",
         "CONFLUENCE_PAT": "replace-me",
-        "CONFLUENCE_SPACE_KEY": "ENG"
+        "CONFLUENCE_SPACE_KEY": "ENG",
+        "CONFLUENCE_ALLOWED_SPACES": "NOR,PM,DEV",
+        "CONFLUENCE_BLOCKED_LABELS": "sensitive,restricted,phi,pii,security"
       }
     }
   }
@@ -175,6 +194,6 @@ Use whatever MCP client you have. The server expects environment variables to be
 ## Notes
 
 - If your Data Center instance is hosted under a path prefix, set `CONFLUENCE_API_PATH` to the correct REST root, for example `/confluence/rest/api`.
-- `confluence_search` generates CQL from `query` unless you pass raw `cql`.
+- `confluence_search` generates CQL from `query` unless you pass raw `cql`. Raw CQL is still constrained by the configured guardrails.
 - Write bodies must be Confluence storage-format XHTML. The server does not convert Markdown or plain text.
 - The server returns tool errors as MCP tool failures (`isError: true`) rather than crashing the process.

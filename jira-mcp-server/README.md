@@ -35,8 +35,25 @@ Copy `.env.example` into your client-side environment configuration and set:
 - `JIRA_PASSWORD`: basic-auth password
 - `JIRA_PROJECT_KEY`: optional default project filter for generated searches
 - `JIRA_JQL_FILTER`: optional JQL appended to generated searches
+- `JIRA_ALLOWED_PROJECTS`: optional comma-separated project allowlist enforced on all reads and writes, for example `PMO,DB,REV`
+- `JIRA_BLOCKED_LABELS`: optional comma-separated labels and issue security level names to block. Defaults to `sensitive,restricted,phi,pii,security`
 
 The write tools do not use a separate enable flag. If the configured account can write in Jira, the tools can write after their dry-run confirmation step.
+
+## Guardrails
+
+Use `JIRA_ALLOWED_PROJECTS` to limit the server to approved Jira projects. When it is set, every search, issue fetch, project list, issue create, issue update, transition, assignment, and comment is checked against that allowlist. Raw JQL is still allowed, but the server wraps it with a `project in (...)` condition so callers cannot bypass the allowlist.
+
+Issues with labels listed in `JIRA_BLOCKED_LABELS` are blocked. If Jira returns an issue security level, matching security level names or descriptions are blocked too. The server requests project, label, and security metadata before returning issue descriptions or building write previews for existing issues.
+
+For Codex Desktop installs, set these under `[mcp_servers.jira.env]` in `~/.codex/config.toml` on macOS/Linux or `%USERPROFILE%\.codex\config.toml` on Windows.
+
+NDA-safe example:
+
+```bash
+JIRA_ALLOWED_PROJECTS=PMO,DB,REV
+JIRA_BLOCKED_LABELS=sensitive,restricted,phi,pii,security
+```
 
 ## Data Center Recommendation
 
@@ -192,7 +209,9 @@ Use whatever MCP client you have. The server expects environment variables to be
         "JIRA_BASE_URL": "https://jira.nimhda.org",
         "JIRA_API_PATH": "/rest/api/2",
         "JIRA_AUTH_MODE": "bearer",
-        "JIRA_PAT": "replace-me"
+        "JIRA_PAT": "replace-me",
+        "JIRA_ALLOWED_PROJECTS": "PMO,DB,REV",
+        "JIRA_BLOCKED_LABELS": "sensitive,restricted,phi,pii,security"
       }
     }
   }
@@ -201,7 +220,7 @@ Use whatever MCP client you have. The server expects environment variables to be
 
 ## Notes
 
-- `jira_search` generates JQL from `query` unless you pass raw `jql`.
+- `jira_search` generates JQL from `query` unless you pass raw `jql`. Raw JQL is still constrained by the configured guardrails.
 - If your Jira instance is hosted under a path prefix, set `JIRA_API_PATH` to the correct REST root, for example `/jira/rest/api/2`.
 - Write bodies use Jira REST API v2 payload shapes. Use raw `fields` and `update` for custom fields or advanced mutations.
 - The server returns tool errors as MCP tool failures (`isError: true`) rather than crashing the process.

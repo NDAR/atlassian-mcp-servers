@@ -37,6 +37,139 @@ test("tool list includes Jira read and write tools", () => {
   assert.ok(toolNames.includes("jira_list_transitions"));
 });
 
+test("search wraps raw JQL with allowed projects and blocked label filters", async () => {
+  process.env.JIRA_ALLOWED_PROJECTS = "PMO, DB";
+  const fetchCalls = [];
+  global.fetch = async (url, options) => {
+    fetchCalls.push({ url: url.toString(), options });
+    return jsonResponse({
+      startAt: 0,
+      maxResults: 10,
+      total: 3,
+      issues: [
+        issueResponse({ key: "PMO-1", projectKey: "PMO", labels: ["mcp"] }),
+        issueResponse({ key: "ENG-1", projectKey: "ENG", labels: [] }),
+        issueResponse({ key: "DB-1", projectKey: "DB", labels: ["sensitive"] })
+      ]
+    });
+  };
+
+  const result = parseToolJson(await callTool("jira_search", {
+    jql: 'summary ~ "MCP" ORDER BY created DESC'
+  }));
+  const requestBody = JSON.parse(fetchCalls[0].options.body);
+
+  assert.equal(
+    requestBody.jql,
+    '(summary ~ "MCP") AND project in ("PMO", "DB") AND (labels is EMPTY OR labels not in ("sensitive", "restricted", "phi", "pii", "security")) ORDER BY created DESC'
+  );
+  assert.deepEqual(requestBody.fields, [
+    "summary",
+    "status",
+    "assignee",
+    "reporter",
+    "priority",
+    "issuetype",
+    "project",
+    "created",
+    "updated",
+    "resolution",
+    "labels",
+    "security"
+  ]);
+  assert.equal(result.count, 1);
+  assert.equal(result.total, 1);
+  assert.equal(result.issues[0].key, "PMO-1");
+});
+
+test("generated search rejects a requested project outside the allowlist", async () => {
+  process.env.JIRA_ALLOWED_PROJECTS = "PMO";
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    throw new Error("fetch should not be called");
+  };
+
+  const result = await callTool("jira_search", {
+    query: "mcp",
+    projectKey: "ENG"
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /JIRA_ALLOWED_PROJECTS/);
+  assert.equal(fetchCalls.length, 0);
+});
+
+test("get issue rejects issues outside allowed projects before returning description", async () => {
+  process.env.JIRA_ALLOWED_PROJECTS = "PMO";
+  global.fetch = async () => jsonResponse(
+    issueResponse({ key: "ENG-42", projectKey: "ENG", description: "private details" })
+  );
+
+  const result = await callTool("jira_get_issue", { issueKey: "ENG-42" });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /JIRA_ALLOWED_PROJECTS/);
+  assert.doesNotMatch(result.content[0].text, /private details/);
+});
+
+test("get issue rejects blocked labels and security before returning description", async () => {
+  global.fetch = async () => jsonResponse(
+    issueResponse({
+      key: "PMO-42",
+      projectKey: "PMO",
+      labels: ["phi"],
+      security: { name: "Internal" },
+      description: "private details"
+    })
+  );
+
+  const result = await callTool("jira_get_issue", { issueKey: "PMO-42" });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /blocked label phi/);
+  assert.doesNotMatch(result.content[0].text, /private details/);
+});
+
+test("writes reject disallowed projects and blocked target issues before preview", async () => {
+  process.env.JIRA_ALLOWED_PROJECTS = "PMO";
+  const fetchCalls = [];
+  global.fetch = async (...args) => {
+    fetchCalls.push(args);
+    return jsonResponse(issueResponse({ key: "PMO-42", projectKey: "PMO", labels: ["restricted"] }));
+  };
+
+  const create = await callTool("jira_create_issue", {
+    projectKey: "ENG",
+    issueType: "Task",
+    summary: "New issue"
+  });
+  const update = await callTool("jira_update_issue", {
+    issueKey: "PMO-42",
+    summary: "Updated"
+  });
+
+  assert.equal(create.isError, true);
+  assert.match(create.content[0].text, /JIRA_ALLOWED_PROJECTS/);
+  assert.equal(update.isError, true);
+  assert.match(update.content[0].text, /blocked label restricted/);
+  assert.equal(fetchCalls.length, 1);
+});
+
+test("list projects is scoped to allowed projects", async () => {
+  process.env.JIRA_ALLOWED_PROJECTS = "PMO";
+  global.fetch = async () => jsonResponse([
+    { id: "1", key: "PMO", name: "PMO" },
+    { id: "2", key: "ENG", name: "Engineering" }
+  ]);
+
+  const result = parseToolJson(await callTool("jira_list_projects", {}));
+
+  assert.equal(result.count, 1);
+  assert.equal(result.totalAvailable, 1);
+  assert.equal(result.projects[0].key, "PMO");
+});
+
 test("create issue dry-run returns a preview without writing", async () => {
   const fetchCalls = [];
   global.fetch = async (...args) => {
@@ -273,31 +406,37 @@ test("transition issue posts transition payload and audit comment", async () => 
 test("list transitions returns available workflow actions", async () => {
   global.fetch = async (url, options) => {
     assert.equal(options.method, "GET");
-    assert.equal(
-      url.toString(),
-      "https://jira.example.test/rest/api/2/issue/ENG-42/transitions?expand=transitions.fields"
-    );
-    return jsonResponse({
-      transitions: [
-        {
-          id: "51",
-          name: "Done",
-          to: {
-            id: "10001",
+    if (url.toString().includes("/issue/ENG-42?")) {
+      return jsonResponse(issueResponse());
+    }
+    if (url.toString().includes("/issue/ENG-42/transitions")) {
+      assert.equal(
+        url.toString(),
+        "https://jira.example.test/rest/api/2/issue/ENG-42/transitions?expand=transitions.fields"
+      );
+      return jsonResponse({
+        transitions: [
+          {
+            id: "51",
             name: "Done",
-            statusCategory: { name: "Done" }
-          },
-          hasScreen: false,
-          fields: {
-            resolution: {
-              required: true,
-              name: "Resolution",
-              allowedValues: [{ id: "1", name: "Done" }]
+            to: {
+              id: "10001",
+              name: "Done",
+              statusCategory: { name: "Done" }
+            },
+            hasScreen: false,
+            fields: {
+              resolution: {
+                required: true,
+                name: "Resolution",
+                allowedValues: [{ id: "1", name: "Done" }]
+              }
             }
           }
-        }
-      ]
-    });
+        ]
+      });
+    }
+    throw new Error(`unexpected URL ${url}`);
   };
 
   const result = parseToolJson(await callTool("jira_list_transitions", {
@@ -362,6 +501,9 @@ test("add comment appends attribution footer by default", async () => {
   const fetchCalls = [];
   global.fetch = async (url, options) => {
     fetchCalls.push({ url: url.toString(), options });
+    if (options.method === "GET") {
+      return jsonResponse(issueResponse());
+    }
     return jsonResponse({ id: "903", body: JSON.parse(options.body).body });
   };
 
@@ -377,7 +519,7 @@ test("add comment appends attribution footer by default", async () => {
     dryRun: false,
     confirmationToken: token
   });
-  const requestBody = JSON.parse(fetchCalls[0].options.body);
+  const requestBody = JSON.parse(fetchCalls.find((call) => call.options.method === "POST").options.body);
   const result = parseToolJson(execute);
 
   assert.equal(requestBody.body, "Looks good.\n\nPosted with Codex via Jira MCP.");
@@ -496,10 +638,16 @@ function emptyResponse() {
   });
 }
 
-function issueResponse() {
+function issueResponse({
+  key = "ENG-42",
+  projectKey = "ENG",
+  labels = ["mcp"],
+  security = null,
+  description = "Description"
+} = {}) {
   return {
     id: "10001",
-    key: "ENG-42",
+    key,
     fields: {
       summary: "Existing issue",
       issuetype: { name: "Task" },
@@ -508,17 +656,18 @@ function issueResponse() {
         statusCategory: { name: "In Progress" }
       },
       priority: { name: "High" },
-      project: { key: "ENG", name: "Engineering" },
+      project: { key: projectKey, name: `${projectKey} Project` },
       assignee: { name: "kimny", displayName: "Kim Ny", active: true },
       reporter: { name: "reporter", displayName: "Reporter", active: true },
       created: "2026-06-26T00:00:00.000+0000",
       updated: "2026-06-26T12:00:00.000+0000",
       resolution: null,
-      labels: ["mcp"],
+      labels,
+      security,
       components: [{ id: "1", name: "API" }],
       fixVersions: [{ id: "2", name: "2026 Jun" }],
       versions: [],
-      description: "Description"
+      description
     }
   };
 }

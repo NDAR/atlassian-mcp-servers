@@ -14,6 +14,9 @@ const skillTarget = path.join(codexDir, "skills", "nda-atlassian");
 
 const confluenceServer = path.join(repoRoot, "confluence-mcp-server", "src", "server.mjs");
 const jiraServer = path.join(repoRoot, "jira-mcp-server", "src", "server.mjs");
+const DEFAULT_CONFLUENCE_ALLOWED_SPACES = "NOR,PM,DEV";
+const DEFAULT_JIRA_ALLOWED_PROJECTS = "PMO,DB,REV";
+const DEFAULT_BLOCKED_CLASSIFICATIONS = "sensitive,restricted,phi,pii,security";
 
 main().catch((error) => {
   console.error(`\nInstall failed: ${error.message}`);
@@ -38,6 +41,10 @@ async function main() {
   const existingJiraPat = readTomlValue(existingConfig, "JIRA_PAT");
   const existingConfluenceBaseUrl = readTomlValue(existingConfig, "CONFLUENCE_BASE_URL");
   const existingJiraBaseUrl = readTomlValue(existingConfig, "JIRA_BASE_URL");
+  const existingConfluenceAllowedSpaces = readTomlValue(existingConfig, "CONFLUENCE_ALLOWED_SPACES");
+  const existingJiraAllowedProjects = readTomlValue(existingConfig, "JIRA_ALLOWED_PROJECTS");
+  const existingConfluenceBlockedLabels = readTomlValue(existingConfig, "CONFLUENCE_BLOCKED_LABELS");
+  const existingJiraBlockedLabels = readTomlValue(existingConfig, "JIRA_BLOCKED_LABELS");
 
   console.log("You need your Confluence URL, Jira URL, and one personal access token for each service.");
   console.log("The tokens are saved only in your local Codex config file.\n");
@@ -46,6 +53,22 @@ async function main() {
   const jiraBaseUrl = process.env.JIRA_BASE_URL || await askText("Jira URL", existingJiraBaseUrl);
   const confluencePat = process.env.CONFLUENCE_PAT || await askToken("Confluence PAT", existingConfluencePat);
   const jiraPat = process.env.JIRA_PAT || await askToken("Jira PAT", existingJiraPat);
+  const confluenceAllowedSpaces =
+    process.env.CONFLUENCE_ALLOWED_SPACES ||
+    existingConfluenceAllowedSpaces ||
+    DEFAULT_CONFLUENCE_ALLOWED_SPACES;
+  const jiraAllowedProjects =
+    process.env.JIRA_ALLOWED_PROJECTS ||
+    existingJiraAllowedProjects ||
+    DEFAULT_JIRA_ALLOWED_PROJECTS;
+  const confluenceBlockedLabels =
+    process.env.CONFLUENCE_BLOCKED_LABELS ||
+    existingConfluenceBlockedLabels ||
+    DEFAULT_BLOCKED_CLASSIFICATIONS;
+  const jiraBlockedLabels =
+    process.env.JIRA_BLOCKED_LABELS ||
+    existingJiraBlockedLabels ||
+    DEFAULT_BLOCKED_CLASSIFICATIONS;
 
   if (!confluenceBaseUrl) {
     throw new Error("Confluence URL is required");
@@ -67,7 +90,11 @@ async function main() {
     confluenceBaseUrl: normalizeBaseUrl(confluenceBaseUrl),
     jiraBaseUrl: normalizeBaseUrl(jiraBaseUrl),
     confluencePat,
-    jiraPat
+    jiraPat,
+    confluenceAllowedSpaces,
+    jiraAllowedProjects,
+    confluenceBlockedLabels,
+    jiraBlockedLabels
   });
 
   if (fs.existsSync(configPath)) {
@@ -80,6 +107,8 @@ async function main() {
   installSkill();
 
   console.log("\nDone.");
+  console.log(`Confluence allowed spaces: ${confluenceAllowedSpaces}`);
+  console.log(`Jira allowed projects: ${jiraAllowedProjects}`);
   console.log("\nNext steps:");
   console.log("1. Quit and reopen Codex Desktop.");
   console.log("2. Ask Codex: Search Confluence for NDA data dictionary");
@@ -175,6 +204,9 @@ CONFLUENCE_AUTH_MODE = "bearer"
 CONFLUENCE_BASE_URL = "${escapeToml(values.confluenceBaseUrl)}"
 CONFLUENCE_API_PATH = "/rest/api"
 CONFLUENCE_PAT = "${escapeToml(values.confluencePat)}"
+# Guardrails. Edit these comma-separated lists for testing or rollout.
+CONFLUENCE_ALLOWED_SPACES = "${escapeToml(values.confluenceAllowedSpaces)}"
+CONFLUENCE_BLOCKED_LABELS = "${escapeToml(values.confluenceBlockedLabels)}"
 
 [mcp_servers.jira]
 enabled = true
@@ -186,6 +218,9 @@ JIRA_AUTH_MODE = "bearer"
 JIRA_BASE_URL = "${escapeToml(values.jiraBaseUrl)}"
 JIRA_API_PATH = "/rest/api/2"
 JIRA_PAT = "${escapeToml(values.jiraPat)}"
+# Guardrails. Edit these comma-separated lists for testing or rollout.
+JIRA_ALLOWED_PROJECTS = "${escapeToml(values.jiraAllowedProjects)}"
+JIRA_BLOCKED_LABELS = "${escapeToml(values.jiraBlockedLabels)}"
 `;
 
   return `${cleaned}${block}`;

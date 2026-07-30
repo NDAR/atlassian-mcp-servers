@@ -16,6 +16,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
 ];
 
 const CONFIRMATION_TOKEN_TTL_SECONDS = 600;
+const DEFAULT_BLOCKED_LABELS = ["sensitive", "restricted", "phi", "pii", "security"];
 
 export const TOOL_DEFINITIONS = [
   {
@@ -389,32 +390,38 @@ async function confluenceSearch(args) {
   const limit = clampInteger(args.limit, 10, 1, 50);
   const includeArchived = args.includeArchived === true;
   const spaceKey = stringOrUndefined(args.spaceKey) ?? config.defaultSpaceKey;
-  const cql = buildSearchCql({
+  const cql = buildSearchCql(config, {
     query: stringOrUndefined(args.query),
     rawCql: stringOrUndefined(args.cql),
     spaceKey,
-    includeArchived,
-    defaultFilter: config.defaultCqlFilter
+    includeArchived
   });
 
   const data = await confluenceRequest(config, "/content/search", {
     queryParams: {
       cql,
       limit: String(limit),
-      expand: "space,version"
+      expand: "space,version,metadata.labels"
     }
   });
 
   const results = Array.isArray(data.results) ? data.results : [];
-  const normalized = results.map((item) => ({
-    id: item.id ?? null,
-    title: item.title ?? null,
-    type: item.type ?? null,
-    spaceKey: item.space?.key ?? null,
-    lastUpdated: item.version?.when ?? null,
-    url: buildContentUrl(config.baseUrl, item._links),
-    excerpt: extractExcerpt(item)
-  }));
+  const allowedResults = [];
+  for (const item of results) {
+    if (await isConfluenceContentAllowed(config, item)) {
+      allowedResults.push(item);
+    }
+  }
+  const normalized = allowedResults
+    .map((item) => ({
+      id: item.id ?? null,
+      title: item.title ?? null,
+      type: item.type ?? null,
+      spaceKey: item.space?.key ?? null,
+      lastUpdated: item.version?.when ?? null,
+      url: buildContentUrl(config.baseUrl, item._links),
+      excerpt: extractExcerpt(item)
+    }));
 
   return jsonContent({
     cql,
@@ -430,7 +437,10 @@ async function confluenceGetPage(args) {
     throw new Error("pageId is required");
   }
 
-  const expand = stringOrUndefined(args.expand) ?? "body.storage,space,version,ancestors";
+  const expand = mergeExpand(
+    stringOrUndefined(args.expand) ?? "body.storage,space,version,ancestors",
+    ["space", "version", "metadata.labels", "ancestors"]
+  );
   const data = await confluenceRequest(
     config,
     `/content/${encodeURIComponent(pageId)}`,
@@ -438,6 +448,7 @@ async function confluenceGetPage(args) {
       queryParams: { expand }
     }
   );
+  await assertConfluenceContentAllowed(config, data, `Confluence page ${pageId}`);
 
   return jsonContent(normalizePage(config, data));
 }
@@ -448,6 +459,10 @@ async function confluenceCreatePage(args) {
   const title = requiredString(args.title, "title");
   const bodyStorage = quoteGeneratedIntro(requiredString(args.bodyStorage, "bodyStorage"));
   const parentPageId = stringOrUndefined(args.parentPageId);
+  assertAllowedSpace(config, spaceKey, "Confluence page create");
+  if (parentPageId) {
+    await fetchPageForGuardrails(config, parentPageId);
+  }
   const payload = buildCreatePagePayload({ spaceKey, title, bodyStorage, parentPageId });
   const tokenPayload = {
     operation: "confluence_create_page",
@@ -554,6 +569,7 @@ async function confluenceAddComment(args) {
   const config = readConfig();
   const pageId = requiredString(args.pageId, "pageId");
   const bodyStorage = requiredString(args.bodyStorage, "bodyStorage");
+  await fetchPageForGuardrails(config, pageId);
   const payload = buildAddCommentPayload({ pageId, bodyStorage });
   const tokenPayload = {
     operation: "confluence_add_comment",
@@ -710,10 +726,23 @@ async function fetchCurrentPageForUpdate(config, pageId) {
     config,
     `/content/${encodeURIComponent(pageId)}`,
     {
-      queryParams: { expand: "body.storage,space,version" }
+      queryParams: { expand: "body.storage,space,version,metadata.labels,ancestors" }
     }
   );
+  await assertConfluenceContentAllowed(config, data, `Confluence page ${pageId}`);
   return normalizePage(config, data);
+}
+
+async function fetchPageForGuardrails(config, pageId) {
+  const data = await confluenceRequest(
+    config,
+    `/content/${encodeURIComponent(pageId)}`,
+    {
+      queryParams: { expand: "space,version,metadata.labels,ancestors" }
+    }
+  );
+  await assertConfluenceContentAllowed(config, data, `Confluence page ${pageId}`);
+  return data;
 }
 
 function assertCurrentVersion(page, expectedVersion) {
@@ -854,7 +883,9 @@ function readConfig() {
     bearerToken: token,
     authSecret: authMode === "basic" ? password ?? apiToken : token,
     defaultSpaceKey: stringOrUndefined(process.env.CONFLUENCE_SPACE_KEY),
-    defaultCqlFilter: stringOrUndefined(process.env.CONFLUENCE_CQL_FILTER)
+    defaultCqlFilter: stringOrUndefined(process.env.CONFLUENCE_CQL_FILTER),
+    allowedSpaces: parseCsvEnv(process.env.CONFLUENCE_ALLOWED_SPACES),
+    blockedLabels: parseCsvEnv(process.env.CONFLUENCE_BLOCKED_LABELS, DEFAULT_BLOCKED_LABELS)
   };
 }
 
@@ -879,33 +910,200 @@ function normalizeApiPath(value) {
     : withLeadingSlash;
 }
 
-function buildSearchCql({ query, rawCql, spaceKey, includeArchived, defaultFilter }) {
+function buildSearchCql(config, { query, rawCql, spaceKey, includeArchived }) {
+  let cql;
   if (rawCql) {
-    return rawCql;
+    cql = rawCql;
+  } else {
+    if (!query) {
+      throw new Error("Either query or cql must be provided");
+    }
+
+    const clauses = [
+      "type = page",
+      `text ~ "${escapeCqlString(query)}"`
+    ];
+
+    if (spaceKey) {
+      assertAllowedSpace(config, spaceKey, "Confluence search");
+      clauses.push(`space = "${escapeCqlString(spaceKey)}"`);
+    }
+
+    if (config.defaultCqlFilter) {
+      clauses.push(`(${config.defaultCqlFilter})`);
+    }
+
+    cql = clauses.join(" AND ");
   }
 
-  if (!query) {
-    throw new Error("Either query or cql must be provided");
-  }
-
-  const clauses = [
-    "type = page",
-    `text ~ "${escapeCqlString(query)}"`
-  ];
-
-  if (spaceKey) {
-    clauses.push(`space = "${escapeCqlString(spaceKey)}"`);
-  }
-
-  if (defaultFilter) {
-    clauses.push(`(${defaultFilter})`);
-  }
-
-  return clauses.join(" AND ");
+  return applyCqlGuardrails(config, cql);
 }
 
 function escapeCqlString(value) {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function applyCqlGuardrails(config, cql) {
+  if (!hasConfluenceGuardrails(config)) {
+    return cql;
+  }
+
+  const { where, orderBy } = splitOrderBy(cql);
+  const clauses = where ? [`(${where})`] : [];
+  if (config.allowedSpaces.length > 0) {
+    clauses.push(
+      `space in (${config.allowedSpaces.map((space) => `"${escapeCqlString(space)}"`).join(", ")})`
+    );
+  }
+  if (config.blockedLabels.length > 0) {
+    clauses.push(
+      `label not in (${config.blockedLabels.map((label) => `"${escapeCqlString(label)}"`).join(", ")})`
+    );
+  }
+  const guarded = clauses.join(" AND ");
+  return orderBy ? `${guarded} ${orderBy}` : guarded;
+}
+
+function hasConfluenceGuardrails(config) {
+  return config.allowedSpaces.length > 0 || config.blockedLabels.length > 0;
+}
+
+function splitOrderBy(query) {
+  const match = /\s+ORDER\s+BY\s+/i.exec(query);
+  if (!match) {
+    return { where: query, orderBy: "" };
+  }
+  return {
+    where: query.slice(0, match.index).trim(),
+    orderBy: query.slice(match.index).trim()
+  };
+}
+
+function parseCsvEnv(value, fallback = []) {
+  const source = value === undefined ? fallback : String(value).split(",");
+  return source
+    .map((item) => String(item).trim())
+    .filter((item) => item.length > 0);
+}
+
+function assertAllowedSpace(config, spaceKey, target) {
+  if (!isAllowedSpace(config, spaceKey)) {
+    throw new Error(
+      `${target} is restricted by guardrails because space ${spaceKey ?? "(unknown)"} is not in CONFLUENCE_ALLOWED_SPACES`
+    );
+  }
+}
+
+function isAllowedSpace(config, spaceKey) {
+  if (config.allowedSpaces.length === 0) {
+    return true;
+  }
+  if (!spaceKey) {
+    return false;
+  }
+  const normalized = spaceKey.toLowerCase();
+  return config.allowedSpaces.some((allowed) => allowed.toLowerCase() === normalized);
+}
+
+async function assertConfluenceContentAllowed(config, content, target, visitedPageIds = new Set()) {
+  const spaceKey = content?.space?.key ?? null;
+  assertAllowedSpace(config, spaceKey, target);
+
+  const blockedLabel = findBlockedLabel(config, getConfluenceLabelNames(content));
+  if (blockedLabel) {
+    throw new Error(
+      `${target} is restricted by guardrails because it has blocked label ${blockedLabel}`
+    );
+  }
+
+  await assertAncestorsAllowed(config, content, target, visitedPageIds);
+}
+
+async function isConfluenceContentAllowed(config, content) {
+  try {
+    const contentId = stringOrUndefined(content?.id);
+    const contentForGuardrails = contentId && !Array.isArray(content?.ancestors)
+      ? await fetchPageMetadata(config, contentId)
+      : content;
+    await assertConfluenceContentAllowed(
+      config,
+      contentForGuardrails,
+      `Confluence page ${contentId ?? "(unknown)"}`
+    );
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+async function assertAncestorsAllowed(config, content, target, visitedPageIds) {
+  const ancestors = Array.isArray(content?.ancestors) ? content.ancestors : [];
+  for (const ancestor of ancestors) {
+    const ancestorId = stringOrUndefined(ancestor?.id);
+    if (!ancestorId || visitedPageIds.has(ancestorId)) {
+      continue;
+    }
+    visitedPageIds.add(ancestorId);
+
+    const ancestorMetadata = hasConfluenceLabelMetadata(ancestor) && ancestor.space?.key
+      ? ancestor
+      : await fetchPageMetadata(config, ancestorId);
+
+    assertAllowedSpace(config, ancestorMetadata?.space?.key ?? null, `${target} ancestor ${ancestorId}`);
+    const blockedLabel = findBlockedLabel(config, getConfluenceLabelNames(ancestorMetadata));
+    if (blockedLabel) {
+      throw new Error(
+        `${target} is restricted by guardrails because ancestor page ${ancestorId} has blocked label ${blockedLabel}`
+      );
+    }
+
+    await assertAncestorsAllowed(config, ancestorMetadata, target, visitedPageIds);
+  }
+}
+
+async function fetchPageMetadata(config, pageId) {
+  return await confluenceRequest(
+    config,
+    `/content/${encodeURIComponent(pageId)}`,
+    {
+      queryParams: { expand: "space,metadata.labels,ancestors" }
+    }
+  );
+}
+
+function hasConfluenceLabelMetadata(content) {
+  return Array.isArray(content?.metadata?.labels?.results);
+}
+
+function getConfluenceLabelNames(content) {
+  const labels = content?.metadata?.labels?.results;
+  if (!Array.isArray(labels)) {
+    return [];
+  }
+  return labels
+    .map((label) => stringOrUndefined(label?.name ?? label))
+    .filter((label) => label);
+}
+
+function findBlockedLabel(config, labels) {
+  if (config.blockedLabels.length === 0 || labels.length === 0) {
+    return null;
+  }
+  const blocked = new Set(config.blockedLabels.map((label) => label.toLowerCase()));
+  return labels.find((label) => blocked.has(label.toLowerCase())) ?? null;
+}
+
+function mergeExpand(expand, requiredFields) {
+  const fields = new Set(
+    String(expand)
+      .split(",")
+      .map((field) => field.trim())
+      .filter((field) => field)
+  );
+  for (const field of requiredFields) {
+    fields.add(field);
+  }
+  return Array.from(fields).join(",");
 }
 
 async function confluenceRequest(config, endpointPath, options = {}) {

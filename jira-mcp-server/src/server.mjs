@@ -17,6 +17,8 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
 
 const CONFIRMATION_TOKEN_TTL_SECONDS = 600;
 const CODEX_ATTRIBUTION_LABEL = "codex-assisted";
+const DEFAULT_BLOCKED_LABELS = ["sensitive", "restricted", "phi", "pii", "security"];
+const GUARDRAIL_ISSUE_FIELDS = ["project", "labels", "security"];
 
 const DEFAULT_SEARCH_FIELDS = [
   "summary",
@@ -28,13 +30,14 @@ const DEFAULT_SEARCH_FIELDS = [
   "project",
   "created",
   "updated",
-  "resolution"
+  "resolution",
+  "labels",
+  "security"
 ];
 
 const DEFAULT_ISSUE_FIELDS = [
   ...DEFAULT_SEARCH_FIELDS,
   "description",
-  "labels",
   "components",
   "fixVersions",
   "versions"
@@ -622,13 +625,12 @@ async function jiraSearch(args) {
   const startAt = clampInteger(args.startAt, 0, 0, 100000);
   const maxResults = clampInteger(args.maxResults, 10, 1, 50);
   const projectKey = stringOrUndefined(args.projectKey) ?? config.defaultProjectKey;
-  const jql = buildSearchJql({
+  const jql = buildSearchJql(config, {
     query: stringOrUndefined(args.query),
     rawJql: stringOrUndefined(args.jql),
-    projectKey,
-    defaultFilter: config.defaultJqlFilter
+    projectKey
   });
-  const fields = normalizeFieldList(args.fields, DEFAULT_SEARCH_FIELDS);
+  const fields = mergeFieldList(normalizeFieldList(args.fields, DEFAULT_SEARCH_FIELDS), GUARDRAIL_ISSUE_FIELDS);
 
   const body = {
     jql,
@@ -646,13 +648,15 @@ async function jiraSearch(args) {
     body
   });
   const issues = Array.isArray(data.issues) ? data.issues : [];
-  const normalized = issues.map((issue) => normalizeIssue(config.baseUrl, issue));
+  const normalized = issues
+    .filter((issue) => isJiraIssueAllowed(config, issue))
+    .map((issue) => normalizeIssue(config.baseUrl, issue));
 
   return jsonContent({
     jql,
     startAt: data.startAt ?? startAt,
     maxResults: data.maxResults ?? maxResults,
-    total: data.total ?? normalized.length,
+    total: hasJiraGuardrails(config) ? normalized.length : data.total ?? normalized.length,
     count: normalized.length,
     issues: normalized
   });
@@ -665,7 +669,7 @@ async function jiraGetIssue(args) {
     throw new Error("issueKey is required");
   }
 
-  const fields = normalizeFieldList(args.fields, DEFAULT_ISSUE_FIELDS);
+  const fields = mergeFieldList(normalizeFieldList(args.fields, DEFAULT_ISSUE_FIELDS), GUARDRAIL_ISSUE_FIELDS);
   const queryParams = {
     fields: fields.join(",")
   };
@@ -679,6 +683,7 @@ async function jiraGetIssue(args) {
     `/issue/${encodeURIComponent(issueKey)}`,
     { queryParams }
   );
+  assertJiraIssueAllowed(config, data, `Jira issue ${issueKey}`);
 
   return jsonContent(normalizeIssue(config.baseUrl, data, { includeDescription: true }));
 }
@@ -692,7 +697,8 @@ async function jiraListProjects(args) {
     }
   });
   const projects = Array.isArray(data) ? data : [];
-  const normalized = projects.slice(0, limit).map((project) => ({
+  const visibleProjects = projects.filter((project) => isAllowedProject(config, project.key));
+  const normalized = visibleProjects.slice(0, limit).map((project) => ({
     id: project.id ?? null,
     key: project.key ?? null,
     name: project.name ?? null,
@@ -705,7 +711,7 @@ async function jiraListProjects(args) {
 
   return jsonContent({
     count: normalized.length,
-    totalAvailable: projects.length,
+    totalAvailable: visibleProjects.length,
     projects: normalized
   });
 }
@@ -731,6 +737,7 @@ async function jiraCreateIssue(args) {
   const issueType = requiredString(args.issueType, "issueType");
   const summary = requiredString(args.summary, "summary");
   const codexAttribution = args.codexAttribution !== false;
+  assertAllowedProject(config, projectKey, "Jira issue create");
   const fields = {
     project: { key: projectKey },
     issuetype: { name: issueType },
@@ -746,6 +753,7 @@ async function jiraCreateIssue(args) {
       `Created with Codex via Jira MCP on ${currentDateString()} at the user's request.`
     );
   }
+  assertJiraPayloadAllowed(config, { fields }, "Jira issue create");
 
   const payload = { fields };
   const tokenPayload = buildTokenPayload({
@@ -778,6 +786,7 @@ async function jiraCreateIssue(args) {
 async function jiraUpdateIssue(args) {
   const config = readConfig();
   const issueKey = requiredString(args.issueKey, "issueKey");
+  await fetchIssueForGuardrails(config, issueKey);
   const fields = {
     ...buildCommonIssueFields(args),
     ...objectOrUndefined(args.fields, "fields")
@@ -794,6 +803,7 @@ async function jiraUpdateIssue(args) {
   if (update) {
     payload.update = update;
   }
+  assertJiraPayloadAllowed(config, payload, `Jira issue ${issueKey} update`);
 
   const auditComment = args.codexAttribution === false
     ? null
@@ -833,6 +843,7 @@ async function jiraTransitionIssue(args) {
   const config = readConfig();
   const issueKey = requiredString(args.issueKey, "issueKey");
   const transitionId = requiredString(args.transitionId, "transitionId");
+  await fetchIssueForGuardrails(config, issueKey);
   const fields = objectOrUndefined(args.fields, "fields");
   let update = objectOrUndefined(args.update, "update");
   const comment = stringOrUndefined(args.comment);
@@ -849,6 +860,7 @@ async function jiraTransitionIssue(args) {
   if (update) {
     payload.update = update;
   }
+  assertJiraPayloadAllowed(config, payload, `Jira issue ${issueKey} transition`);
 
   const auditComment = args.codexAttribution === false
     ? null
@@ -891,6 +903,7 @@ async function jiraTransitionIssue(args) {
 async function jiraAssignIssue(args) {
   const config = readConfig();
   const issueKey = requiredString(args.issueKey, "issueKey");
+  await fetchIssueForGuardrails(config, issueKey);
   const unassign = args.unassign === true;
   const name = stringOrUndefined(args.name);
   const accountId = stringOrUndefined(args.accountId);
@@ -945,6 +958,7 @@ async function jiraAddComment(args) {
   const config = readConfig();
   const issueKey = requiredString(args.issueKey, "issueKey");
   const body = requiredString(args.body, "body");
+  await fetchIssueForGuardrails(config, issueKey);
   const commentBody = args.codexAttribution === false
     ? body
     : appendCommentFooter(body, "Posted with Codex via Jira MCP.");
@@ -981,6 +995,7 @@ async function jiraAddComment(args) {
 async function jiraListTransitions(args) {
   const config = readConfig();
   const issueKey = requiredString(args.issueKey, "issueKey");
+  await fetchIssueForGuardrails(config, issueKey);
   const data = await jiraRequest(
     config,
     `/issue/${encodeURIComponent(issueKey)}/transitions`,
@@ -1048,7 +1063,9 @@ function readConfig() {
     bearerToken: token,
     authSecret: authMode === "basic" ? password ?? apiToken : token,
     defaultProjectKey: stringOrUndefined(process.env.JIRA_PROJECT_KEY),
-    defaultJqlFilter: stringOrUndefined(process.env.JIRA_JQL_FILTER)
+    defaultJqlFilter: stringOrUndefined(process.env.JIRA_JQL_FILTER),
+    allowedProjects: parseCsvEnv(process.env.JIRA_ALLOWED_PROJECTS),
+    blockedLabels: parseCsvEnv(process.env.JIRA_BLOCKED_LABELS, DEFAULT_BLOCKED_LABELS)
   };
 }
 
@@ -1073,9 +1090,9 @@ function normalizeApiPath(value) {
     : withLeadingSlash;
 }
 
-function buildSearchJql({ query, rawJql, projectKey, defaultFilter }) {
+function buildSearchJql(config, { query, rawJql, projectKey }) {
   if (rawJql) {
-    return rawJql;
+    return applyJqlGuardrails(config, rawJql);
   }
 
   if (!query) {
@@ -1084,17 +1101,52 @@ function buildSearchJql({ query, rawJql, projectKey, defaultFilter }) {
 
   const clauses = [`text ~ "${escapeJqlString(query)}"`];
   if (projectKey) {
+    assertAllowedProject(config, projectKey, "Jira search");
     clauses.unshift(`project = "${escapeJqlString(projectKey)}"`);
   }
-  if (defaultFilter) {
-    clauses.push(`(${defaultFilter})`);
+  if (config.defaultJqlFilter) {
+    clauses.push(`(${config.defaultJqlFilter})`);
   }
 
-  return `${clauses.join(" AND ")} ORDER BY updated DESC`;
+  return applyJqlGuardrails(config, `${clauses.join(" AND ")} ORDER BY updated DESC`);
 }
 
 function escapeJqlString(value) {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function applyJqlGuardrails(config, jql) {
+  if (!hasJiraGuardrails(config)) {
+    return jql;
+  }
+
+  const { where, orderBy } = splitJqlOrderBy(jql);
+  const clauses = where ? [`(${where})`] : [];
+  if (config.allowedProjects.length > 0) {
+    clauses.push(
+      `project in (${config.allowedProjects.map((project) => `"${escapeJqlString(project)}"`).join(", ")})`
+    );
+  }
+  if (config.blockedLabels.length > 0) {
+    const blockedLabels = config.blockedLabels
+      .map((label) => `"${escapeJqlString(label)}"`)
+      .join(", ");
+    clauses.push(`(labels is EMPTY OR labels not in (${blockedLabels}))`);
+  }
+
+  const guarded = clauses.join(" AND ");
+  return orderBy ? `${guarded} ${orderBy}` : guarded;
+}
+
+function splitJqlOrderBy(jql) {
+  const match = /\s+ORDER\s+BY\s+/i.exec(jql);
+  if (!match) {
+    return { where: jql, orderBy: "" };
+  }
+  return {
+    where: jql.slice(0, match.index).trim(),
+    orderBy: jql.slice(match.index).trim()
+  };
 }
 
 function normalizeFieldList(value, fallback) {
@@ -1107,6 +1159,146 @@ function normalizeFieldList(value, fallback) {
     .filter((field) => field);
 
   return fields.length > 0 ? fields : fallback;
+}
+
+function mergeFieldList(fields, requiredFields) {
+  const merged = [...fields];
+  const normalized = new Set(merged.map((field) => field.toLowerCase()));
+  for (const field of requiredFields) {
+    if (!normalized.has(field.toLowerCase())) {
+      merged.push(field);
+      normalized.add(field.toLowerCase());
+    }
+  }
+  return merged;
+}
+
+function parseCsvEnv(value, fallback = []) {
+  const source = value === undefined ? fallback : String(value).split(",");
+  return source
+    .map((item) => String(item).trim())
+    .filter((item) => item.length > 0);
+}
+
+async function fetchIssueForGuardrails(config, issueKey) {
+  const issue = await jiraRequest(config, `/issue/${encodeURIComponent(issueKey)}`, {
+    queryParams: {
+      fields: GUARDRAIL_ISSUE_FIELDS.join(",")
+    }
+  });
+  assertJiraIssueAllowed(config, issue, `Jira issue ${issueKey}`);
+  return issue;
+}
+
+function hasJiraGuardrails(config) {
+  return config.allowedProjects.length > 0 || config.blockedLabels.length > 0;
+}
+
+function assertAllowedProject(config, projectKey, target) {
+  if (!isAllowedProject(config, projectKey)) {
+    throw new Error(
+      `${target} is restricted by guardrails because project ${projectKey ?? "(unknown)"} is not in JIRA_ALLOWED_PROJECTS`
+    );
+  }
+}
+
+function isAllowedProject(config, projectKey) {
+  if (config.allowedProjects.length === 0) {
+    return true;
+  }
+  if (!projectKey) {
+    return false;
+  }
+  const normalized = projectKey.toLowerCase();
+  return config.allowedProjects.some((allowed) => allowed.toLowerCase() === normalized);
+}
+
+function assertJiraIssueAllowed(config, issue, target) {
+  const fields = issue?.fields ?? {};
+  assertAllowedProject(config, fields.project?.key ?? null, target);
+
+  const blockedLabel = findBlockedLabel(config, Array.isArray(fields.labels) ? fields.labels : []);
+  if (blockedLabel) {
+    throw new Error(
+      `${target} is restricted by guardrails because it has blocked label ${blockedLabel}`
+    );
+  }
+
+  const blockedSecurityLevel = findBlockedLabel(config, [fields.security?.name, fields.security?.description].filter(Boolean));
+  if (blockedSecurityLevel) {
+    throw new Error(
+      `${target} is restricted by guardrails because it has blocked security level ${blockedSecurityLevel}`
+    );
+  }
+}
+
+function isJiraIssueAllowed(config, issue) {
+  try {
+    assertJiraIssueAllowed(config, issue, `Jira issue ${issue?.key ?? issue?.id ?? "(unknown)"}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function assertJiraPayloadAllowed(config, payload, target) {
+  const projectKey = payload?.fields?.project?.key;
+  if (projectKey) {
+    assertAllowedProject(config, projectKey, target);
+  }
+
+  const labels = [
+    ...normalizePayloadLabels(payload?.fields?.labels),
+    ...normalizePayloadUpdateLabels(payload?.update?.labels)
+  ];
+  const blockedLabel = findBlockedLabel(config, labels);
+  if (blockedLabel) {
+    throw new Error(
+      `${target} is restricted by guardrails because it uses blocked label ${blockedLabel}`
+    );
+  }
+
+  const blockedSecurityLevel = findBlockedLabel(config, [
+    payload?.fields?.security?.name,
+    payload?.fields?.security?.description
+  ].filter(Boolean));
+  if (blockedSecurityLevel) {
+    throw new Error(
+      `${target} is restricted by guardrails because it uses blocked security level ${blockedSecurityLevel}`
+    );
+  }
+}
+
+function normalizePayloadLabels(labels) {
+  if (!Array.isArray(labels)) {
+    return [];
+  }
+  return labels
+    .map((label) => stringOrUndefined(label))
+    .filter((label) => label);
+}
+
+function normalizePayloadUpdateLabels(labelUpdates) {
+  if (!Array.isArray(labelUpdates)) {
+    return [];
+  }
+  return labelUpdates
+    .flatMap((operation) => {
+      if (!operation || typeof operation !== "object") {
+        return [];
+      }
+      return [operation.add, operation.set].flat();
+    })
+    .map((label) => stringOrUndefined(label))
+    .filter((label) => label);
+}
+
+function findBlockedLabel(config, labels) {
+  if (config.blockedLabels.length === 0 || labels.length === 0) {
+    return null;
+  }
+  const blocked = new Set(config.blockedLabels.map((label) => label.toLowerCase()));
+  return labels.find((label) => blocked.has(label.toLowerCase())) ?? null;
 }
 
 async function previewOrExecuteWrite({ config, args, tokenPayload, preview, execute }) {
@@ -1443,6 +1635,7 @@ function normalizeIssue(baseUrl, issue, options = {}) {
     updated: fields.updated ?? null,
     resolution: fields.resolution?.name ?? null,
     labels: Array.isArray(fields.labels) ? fields.labels : [],
+    securityLevel: fields.security?.name ?? null,
     components: normalizeNamedArray(fields.components),
     fixVersions: normalizeNamedArray(fields.fixVersions),
     versions: normalizeNamedArray(fields.versions),
