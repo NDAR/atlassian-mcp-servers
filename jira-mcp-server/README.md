@@ -35,14 +35,14 @@ Copy `.env.example` into your client-side environment configuration and set:
 - `JIRA_PASSWORD`: basic-auth password
 - `JIRA_PROJECT_KEY`: optional default project filter for generated searches
 - `JIRA_JQL_FILTER`: optional JQL appended to generated searches
-- `JIRA_ALLOWED_PROJECTS`: optional comma-separated project allowlist enforced on all reads and writes, for example `PMO,DB,REV`
-- `JIRA_BLOCKED_LABELS`: optional comma-separated labels and issue security level names to block. Defaults to `sensitive,restricted,phi,pii,security`
+- `JIRA_BLOCKED_PROJECTS`: optional comma-separated project blocklist enforced on all reads and writes. An empty value blocks no projects.
+- `JIRA_BLOCKED_LABELS`: optional comma-separated labels and issue security level names to block. Defaults to `sensitive,internal`
 
 The write tools do not use a separate enable flag. If the configured account can write in Jira, the tools can write after their dry-run confirmation step.
 
 ## Guardrails
 
-Use `JIRA_ALLOWED_PROJECTS` to limit the server to approved Jira projects. When it is set, every search, issue fetch, project list, issue create, issue update, transition, assignment, and comment is checked against that allowlist. Raw JQL is still allowed, but the server wraps it with a `project in (...)` condition so callers cannot bypass the allowlist.
+Use `JIRA_BLOCKED_PROJECTS` to deny access to specific Jira projects. When it is set, every search, issue fetch, project list, issue create, issue update, transition, assignment, and comment is checked against that blocklist. Raw JQL is still allowed, but the server wraps it with a `project not in (...)` condition so callers cannot bypass the blocklist. Leave it empty to allow all projects visible to the configured Jira account.
 
 Issues with labels listed in `JIRA_BLOCKED_LABELS` are blocked. If Jira returns an issue security level, matching security level names or descriptions are blocked too. The server requests project, label, and security metadata before returning issue descriptions or building write previews for existing issues.
 
@@ -51,8 +51,8 @@ For Codex Desktop installs, set these under `[mcp_servers.jira.env]` in `~/.code
 NDA-safe example:
 
 ```bash
-JIRA_ALLOWED_PROJECTS=PMO,DB,REV
-JIRA_BLOCKED_LABELS=sensitive,restricted,phi,pii,security
+JIRA_BLOCKED_PROJECTS=
+JIRA_BLOCKED_LABELS=sensitive,internal
 ```
 
 ## Data Center Recommendation
@@ -210,8 +210,8 @@ Use whatever MCP client you have. The server expects environment variables to be
         "JIRA_API_PATH": "/rest/api/2",
         "JIRA_AUTH_MODE": "bearer",
         "JIRA_PAT": "replace-me",
-        "JIRA_ALLOWED_PROJECTS": "PMO,DB,REV",
-        "JIRA_BLOCKED_LABELS": "sensitive,restricted,phi,pii,security"
+        "JIRA_BLOCKED_PROJECTS": "",
+        "JIRA_BLOCKED_LABELS": "sensitive,internal"
       }
     }
   }

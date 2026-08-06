@@ -32,24 +32,26 @@ Copy `.env.example` into your client-side environment configuration and set:
 - `CONFLUENCE_API_TOKEN`: Cloud API token
 - `CONFLUENCE_SPACE_KEY`: optional default space filter
 - `CONFLUENCE_CQL_FILTER`: optional CQL appended to generated searches
-- `CONFLUENCE_ALLOWED_SPACES`: optional comma-separated space allowlist enforced on all reads and writes, for example `NOR,PM,DEV`
-- `CONFLUENCE_BLOCKED_LABELS`: optional comma-separated labels to block. Defaults to `sensitive,restricted,phi,pii,security`
+- `CONFLUENCE_BLOCKED_SPACES`: optional comma-separated space blocklist enforced on all reads and writes, for example `SEC`
+- `CONFLUENCE_BLOCKED_LABELS`: optional comma-separated labels that block only the page carrying the label. Defaults to `sensitive,internal`
+- `CONFLUENCE_BLOCKED_DESCENDANT_LABELS`: optional comma-separated labels that block the page carrying the label and all child pages. Defaults to `restricted`
 
 The write tools do not use a separate enable flag. If the configured account can write in Confluence, the tools can write after their dry-run confirmation step.
 
 ## Guardrails
 
-Use `CONFLUENCE_ALLOWED_SPACES` to limit the server to approved spaces. When it is set, every search, page fetch, page create, page update, and page comment is checked against that allowlist. Raw CQL is still allowed, but the server wraps it with a `space in (...)` condition so callers cannot bypass the allowlist.
+Use `CONFLUENCE_BLOCKED_SPACES` to block restricted spaces. When it is set, every search, page fetch, page create, page update, and page comment is checked against that blocklist. Raw CQL is still allowed, but the server wraps it with a `space not in (...)` condition so callers cannot bypass the blocklist.
 
-Pages with labels listed in `CONFLUENCE_BLOCKED_LABELS` are blocked. The server checks the page and its ancestor pages, requests labels before returning page bodies, and blocked pages return a tool error without body content.
+Pages with labels listed in `CONFLUENCE_BLOCKED_LABELS` are blocked only when that exact page has the label. Pages with labels listed in `CONFLUENCE_BLOCKED_DESCENDANT_LABELS` are blocked along with their child pages. The server requests page and ancestor labels before returning page bodies, and blocked pages return a tool error without body content.
 
 For Codex Desktop installs, set these under `[mcp_servers.confluence.env]` in `~/.codex/config.toml` on macOS/Linux or `%USERPROFILE%\.codex\config.toml` on Windows.
 
 NDA-safe example:
 
 ```bash
-CONFLUENCE_ALLOWED_SPACES=NOR,PM,DEV
-CONFLUENCE_BLOCKED_LABELS=sensitive,restricted,phi,pii,security
+CONFLUENCE_BLOCKED_SPACES=SEC
+CONFLUENCE_BLOCKED_LABELS=sensitive,internal
+CONFLUENCE_BLOCKED_DESCENDANT_LABELS=restricted
 ```
 
 ## Data Center Recommendation
@@ -183,8 +185,9 @@ Use whatever MCP client you have. The server expects environment variables to be
         "CONFLUENCE_AUTH_MODE": "bearer",
         "CONFLUENCE_PAT": "replace-me",
         "CONFLUENCE_SPACE_KEY": "ENG",
-        "CONFLUENCE_ALLOWED_SPACES": "NOR,PM,DEV",
-        "CONFLUENCE_BLOCKED_LABELS": "sensitive,restricted,phi,pii,security"
+        "CONFLUENCE_BLOCKED_SPACES": "SEC",
+        "CONFLUENCE_BLOCKED_LABELS": "sensitive,internal",
+        "CONFLUENCE_BLOCKED_DESCENDANT_LABELS": "restricted"
       }
     }
   }

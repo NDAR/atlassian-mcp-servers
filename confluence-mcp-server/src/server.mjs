@@ -16,7 +16,8 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
 ];
 
 const CONFIRMATION_TOKEN_TTL_SECONDS = 600;
-const DEFAULT_BLOCKED_LABELS = ["sensitive", "restricted", "phi", "pii", "security"];
+const DEFAULT_BLOCKED_LABELS = ["sensitive", "internal"];
+const DEFAULT_BLOCKED_DESCENDANT_LABELS = ["restricted"];
 
 export const TOOL_DEFINITIONS = [
   {
@@ -459,7 +460,7 @@ async function confluenceCreatePage(args) {
   const title = requiredString(args.title, "title");
   const bodyStorage = quoteGeneratedIntro(requiredString(args.bodyStorage, "bodyStorage"));
   const parentPageId = stringOrUndefined(args.parentPageId);
-  assertAllowedSpace(config, spaceKey, "Confluence page create");
+  assertNotBlockedSpace(config, spaceKey, "Confluence page create");
   if (parentPageId) {
     await fetchPageForGuardrails(config, parentPageId);
   }
@@ -884,8 +885,12 @@ function readConfig() {
     authSecret: authMode === "basic" ? password ?? apiToken : token,
     defaultSpaceKey: stringOrUndefined(process.env.CONFLUENCE_SPACE_KEY),
     defaultCqlFilter: stringOrUndefined(process.env.CONFLUENCE_CQL_FILTER),
-    allowedSpaces: parseCsvEnv(process.env.CONFLUENCE_ALLOWED_SPACES),
-    blockedLabels: parseCsvEnv(process.env.CONFLUENCE_BLOCKED_LABELS, DEFAULT_BLOCKED_LABELS)
+    blockedSpaces: parseCsvEnv(process.env.CONFLUENCE_BLOCKED_SPACES),
+    blockedLabels: parseCsvEnv(process.env.CONFLUENCE_BLOCKED_LABELS, DEFAULT_BLOCKED_LABELS),
+    blockedDescendantLabels: parseCsvEnv(
+      process.env.CONFLUENCE_BLOCKED_DESCENDANT_LABELS,
+      DEFAULT_BLOCKED_DESCENDANT_LABELS
+    )
   };
 }
 
@@ -925,7 +930,7 @@ function buildSearchCql(config, { query, rawCql, spaceKey, includeArchived }) {
     ];
 
     if (spaceKey) {
-      assertAllowedSpace(config, spaceKey, "Confluence search");
+      assertNotBlockedSpace(config, spaceKey, "Confluence search");
       clauses.push(`space = "${escapeCqlString(spaceKey)}"`);
     }
 
@@ -950,14 +955,15 @@ function applyCqlGuardrails(config, cql) {
 
   const { where, orderBy } = splitOrderBy(cql);
   const clauses = where ? [`(${where})`] : [];
-  if (config.allowedSpaces.length > 0) {
+  if (config.blockedSpaces.length > 0) {
     clauses.push(
-      `space in (${config.allowedSpaces.map((space) => `"${escapeCqlString(space)}"`).join(", ")})`
+      `space not in (${config.blockedSpaces.map((space) => `"${escapeCqlString(space)}"`).join(", ")})`
     );
   }
-  if (config.blockedLabels.length > 0) {
+  const searchBlockedLabels = allBlockedConfluenceLabels(config);
+  if (searchBlockedLabels.length > 0) {
     clauses.push(
-      `label not in (${config.blockedLabels.map((label) => `"${escapeCqlString(label)}"`).join(", ")})`
+      `label not in (${searchBlockedLabels.map((label) => `"${escapeCqlString(label)}"`).join(", ")})`
     );
   }
   const guarded = clauses.join(" AND ");
@@ -965,7 +971,11 @@ function applyCqlGuardrails(config, cql) {
 }
 
 function hasConfluenceGuardrails(config) {
-  return config.allowedSpaces.length > 0 || config.blockedLabels.length > 0;
+  return (
+    config.blockedSpaces.length > 0 ||
+    config.blockedLabels.length > 0 ||
+    config.blockedDescendantLabels.length > 0
+  );
 }
 
 function splitOrderBy(query) {
@@ -986,30 +996,30 @@ function parseCsvEnv(value, fallback = []) {
     .filter((item) => item.length > 0);
 }
 
-function assertAllowedSpace(config, spaceKey, target) {
-  if (!isAllowedSpace(config, spaceKey)) {
+function assertNotBlockedSpace(config, spaceKey, target) {
+  if (isBlockedSpace(config, spaceKey)) {
     throw new Error(
-      `${target} is restricted by guardrails because space ${spaceKey ?? "(unknown)"} is not in CONFLUENCE_ALLOWED_SPACES`
+      `${target} is restricted by guardrails because space ${spaceKey ?? "(unknown)"} is in CONFLUENCE_BLOCKED_SPACES`
     );
   }
 }
 
-function isAllowedSpace(config, spaceKey) {
-  if (config.allowedSpaces.length === 0) {
-    return true;
-  }
+function isBlockedSpace(config, spaceKey) {
   if (!spaceKey) {
     return false;
   }
   const normalized = spaceKey.toLowerCase();
-  return config.allowedSpaces.some((allowed) => allowed.toLowerCase() === normalized);
+  return config.blockedSpaces.some((blocked) => blocked.toLowerCase() === normalized);
 }
 
 async function assertConfluenceContentAllowed(config, content, target, visitedPageIds = new Set()) {
   const spaceKey = content?.space?.key ?? null;
-  assertAllowedSpace(config, spaceKey, target);
+  assertNotBlockedSpace(config, spaceKey, target);
 
-  const blockedLabel = findBlockedLabel(config, getConfluenceLabelNames(content));
+  const blockedLabel = findBlockedLabel(
+    allBlockedConfluenceLabels(config),
+    getConfluenceLabelNames(content)
+  );
   if (blockedLabel) {
     throw new Error(
       `${target} is restricted by guardrails because it has blocked label ${blockedLabel}`
@@ -1049,8 +1059,15 @@ async function assertAncestorsAllowed(config, content, target, visitedPageIds) {
       ? ancestor
       : await fetchPageMetadata(config, ancestorId);
 
-    assertAllowedSpace(config, ancestorMetadata?.space?.key ?? null, `${target} ancestor ${ancestorId}`);
-    const blockedLabel = findBlockedLabel(config, getConfluenceLabelNames(ancestorMetadata));
+    assertNotBlockedSpace(
+      config,
+      ancestorMetadata?.space?.key ?? null,
+      `${target} ancestor ${ancestorId}`
+    );
+    const blockedLabel = findBlockedLabel(
+      config.blockedDescendantLabels,
+      getConfluenceLabelNames(ancestorMetadata)
+    );
     if (blockedLabel) {
       throw new Error(
         `${target} is restricted by guardrails because ancestor page ${ancestorId} has blocked label ${blockedLabel}`
@@ -1085,11 +1102,24 @@ function getConfluenceLabelNames(content) {
     .filter((label) => label);
 }
 
-function findBlockedLabel(config, labels) {
-  if (config.blockedLabels.length === 0 || labels.length === 0) {
+function allBlockedConfluenceLabels(config) {
+  const labels = [];
+  const seen = new Set();
+  for (const label of [...config.blockedLabels, ...config.blockedDescendantLabels]) {
+    const normalized = label.toLowerCase();
+    if (!seen.has(normalized)) {
+      labels.push(label);
+      seen.add(normalized);
+    }
+  }
+  return labels;
+}
+
+function findBlockedLabel(blockedLabels, labels) {
+  if (blockedLabels.length === 0 || labels.length === 0) {
     return null;
   }
-  const blocked = new Set(config.blockedLabels.map((label) => label.toLowerCase()));
+  const blocked = new Set(blockedLabels.map((label) => label.toLowerCase()));
   return labels.find((label) => blocked.has(label.toLowerCase())) ?? null;
 }
 

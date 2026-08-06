@@ -56,8 +56,8 @@ The installer will:
 - update `%USERPROFILE%\.codex\config.toml`
 - create a backup of the previous config
 - install the `nda-atlassian` Codex skill
-- limit Confluence to `NOR,PM,DEV` and Jira to `PMO,DB,REV` by default
-- block Confluence pages, Confluence page descendants, and Jira issues labeled `sensitive`, `restricted`, `phi`, `pii`, or `security`
+- block Confluence space `SEC`; the Jira project blocklist is empty by default
+- block Confluence and Jira items labeled `sensitive` or `internal`, and block Confluence descendants under `restricted` parents
 
 Use these NDA URLs when prompted:
 
@@ -110,8 +110,8 @@ The installer will ask for your Confluence URL, Jira URL, Confluence token, and 
 - update `~/.codex/config.toml`
 - create a backup of your previous config
 - install the `nda-atlassian` Codex skill
-- limit Confluence to `NOR,PM,DEV` and Jira to `PMO,DB,REV` by default
-- block Confluence pages, Confluence page descendants, and Jira issues labeled `sensitive`, `restricted`, `phi`, `pii`, or `security`
+- block Confluence space `SEC`; the Jira project blocklist is empty by default
+- block Confluence and Jira items labeled `sensitive` or `internal`, and block Confluence descendants under `restricted` parents
 
 ### 4. Restart Codex
 
@@ -160,13 +160,14 @@ The installer does not ask users to choose these values. For testing or rollout 
 Recommended NDA configuration:
 
 ```text
-CONFLUENCE_ALLOWED_SPACES=NOR,PM,DEV
-JIRA_ALLOWED_PROJECTS=PMO,DB,REV
-CONFLUENCE_BLOCKED_LABELS=sensitive,restricted,phi,pii,security
-JIRA_BLOCKED_LABELS=sensitive,restricted,phi,pii,security
+CONFLUENCE_BLOCKED_SPACES=SEC
+JIRA_BLOCKED_PROJECTS=
+CONFLUENCE_BLOCKED_LABELS=sensitive,internal
+CONFLUENCE_BLOCKED_DESCENDANT_LABELS=restricted
+JIRA_BLOCKED_LABELS=sensitive,internal
 ```
 
-For quick installer testing, you can also set these environment variables before running the installer. The installer writes those values into Codex config. Leave an allowlist unset only if you intentionally want the server to rely on the Atlassian account's own permissions.
+For quick installer testing, you can also set these environment variables before running the installer. The installer writes those values into Codex config. Leave a blocklist unset only if you intentionally want the server to rely on the Atlassian account's own permissions.
 
 ## Troubleshooting
 

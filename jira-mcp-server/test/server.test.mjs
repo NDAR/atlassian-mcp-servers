@@ -37,8 +37,8 @@ test("tool list includes Jira read and write tools", () => {
   assert.ok(toolNames.includes("jira_list_transitions"));
 });
 
-test("search wraps raw JQL with allowed projects and blocked label filters", async () => {
-  process.env.JIRA_ALLOWED_PROJECTS = "PMO, DB";
+test("search wraps raw JQL with blocked projects and blocked label filters", async () => {
+  process.env.JIRA_BLOCKED_PROJECTS = "SEC, HR";
   const fetchCalls = [];
   global.fetch = async (url, options) => {
     fetchCalls.push({ url: url.toString(), options });
@@ -48,7 +48,7 @@ test("search wraps raw JQL with allowed projects and blocked label filters", asy
       total: 3,
       issues: [
         issueResponse({ key: "PMO-1", projectKey: "PMO", labels: ["mcp"] }),
-        issueResponse({ key: "ENG-1", projectKey: "ENG", labels: [] }),
+        issueResponse({ key: "SEC-1", projectKey: "SEC", labels: [] }),
         issueResponse({ key: "DB-1", projectKey: "DB", labels: ["sensitive"] })
       ]
     });
@@ -61,7 +61,7 @@ test("search wraps raw JQL with allowed projects and blocked label filters", asy
 
   assert.equal(
     requestBody.jql,
-    '(summary ~ "MCP") AND project in ("PMO", "DB") AND (labels is EMPTY OR labels not in ("sensitive", "restricted", "phi", "pii", "security")) ORDER BY created DESC'
+    '(summary ~ "MCP") AND project not in ("SEC", "HR") AND (labels is EMPTY OR labels not in ("sensitive", "internal")) ORDER BY created DESC'
   );
   assert.deepEqual(requestBody.fields, [
     "summary",
@@ -82,8 +82,34 @@ test("search wraps raw JQL with allowed projects and blocked label filters", asy
   assert.equal(result.issues[0].key, "PMO-1");
 });
 
-test("generated search rejects a requested project outside the allowlist", async () => {
-  process.env.JIRA_ALLOWED_PROJECTS = "PMO";
+test("empty project blocklist leaves Jira projects unrestricted", async () => {
+  process.env.JIRA_BLOCKED_PROJECTS = "";
+  const fetchCalls = [];
+  global.fetch = async (url, options) => {
+    fetchCalls.push({ url: url.toString(), options });
+    return jsonResponse({
+      startAt: 0,
+      maxResults: 10,
+      total: 1,
+      issues: [issueResponse({ key: "ENG-1", projectKey: "ENG", labels: [] })]
+    });
+  };
+
+  const result = parseToolJson(await callTool("jira_search", {
+    jql: 'summary ~ "MCP"'
+  }));
+  const requestBody = JSON.parse(fetchCalls[0].options.body);
+
+  assert.equal(
+    requestBody.jql,
+    '(summary ~ "MCP") AND (labels is EMPTY OR labels not in ("sensitive", "internal"))'
+  );
+  assert.equal(result.count, 1);
+  assert.equal(result.issues[0].key, "ENG-1");
+});
+
+test("generated search rejects a requested blocked project", async () => {
+  process.env.JIRA_BLOCKED_PROJECTS = "SEC";
   const fetchCalls = [];
   global.fetch = async (...args) => {
     fetchCalls.push(args);
@@ -92,16 +118,16 @@ test("generated search rejects a requested project outside the allowlist", async
 
   const result = await callTool("jira_search", {
     query: "mcp",
-    projectKey: "ENG"
+    projectKey: "SEC"
   });
 
   assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /JIRA_ALLOWED_PROJECTS/);
+  assert.match(result.content[0].text, /JIRA_BLOCKED_PROJECTS/);
   assert.equal(fetchCalls.length, 0);
 });
 
-test("get issue rejects issues outside allowed projects before returning description", async () => {
-  process.env.JIRA_ALLOWED_PROJECTS = "PMO";
+test("get issue rejects issues in blocked projects before returning description", async () => {
+  process.env.JIRA_BLOCKED_PROJECTS = "ENG";
   global.fetch = async () => jsonResponse(
     issueResponse({ key: "ENG-42", projectKey: "ENG", description: "private details" })
   );
@@ -109,7 +135,20 @@ test("get issue rejects issues outside allowed projects before returning descrip
   const result = await callTool("jira_get_issue", { issueKey: "ENG-42" });
 
   assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /JIRA_ALLOWED_PROJECTS/);
+  assert.match(result.content[0].text, /JIRA_BLOCKED_PROJECTS/);
+  assert.doesNotMatch(result.content[0].text, /private details/);
+});
+
+test("get issue fails closed when configured project guardrails cannot verify the project", async () => {
+  process.env.JIRA_BLOCKED_PROJECTS = "SEC";
+  global.fetch = async () => jsonResponse(
+    issueResponse({ key: "ENG-42", projectKey: null, description: "private details" })
+  );
+
+  const result = await callTool("jira_get_issue", { issueKey: "ENG-42" });
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /could not be checked against JIRA_BLOCKED_PROJECTS/);
   assert.doesNotMatch(result.content[0].text, /private details/);
 });
 
@@ -118,7 +157,7 @@ test("get issue rejects blocked labels and security before returning description
     issueResponse({
       key: "PMO-42",
       projectKey: "PMO",
-      labels: ["phi"],
+      labels: ["sensitive"],
       security: { name: "Internal" },
       description: "private details"
     })
@@ -127,16 +166,16 @@ test("get issue rejects blocked labels and security before returning description
   const result = await callTool("jira_get_issue", { issueKey: "PMO-42" });
 
   assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /blocked label phi/);
+  assert.match(result.content[0].text, /blocked label sensitive/);
   assert.doesNotMatch(result.content[0].text, /private details/);
 });
 
-test("writes reject disallowed projects and blocked target issues before preview", async () => {
-  process.env.JIRA_ALLOWED_PROJECTS = "PMO";
+test("writes reject blocked projects and blocked target issues before preview", async () => {
+  process.env.JIRA_BLOCKED_PROJECTS = "ENG";
   const fetchCalls = [];
   global.fetch = async (...args) => {
     fetchCalls.push(args);
-    return jsonResponse(issueResponse({ key: "PMO-42", projectKey: "PMO", labels: ["restricted"] }));
+    return jsonResponse(issueResponse({ key: "PMO-42", projectKey: "PMO", labels: ["internal"] }));
   };
 
   const create = await callTool("jira_create_issue", {
@@ -150,14 +189,14 @@ test("writes reject disallowed projects and blocked target issues before preview
   });
 
   assert.equal(create.isError, true);
-  assert.match(create.content[0].text, /JIRA_ALLOWED_PROJECTS/);
+  assert.match(create.content[0].text, /JIRA_BLOCKED_PROJECTS/);
   assert.equal(update.isError, true);
-  assert.match(update.content[0].text, /blocked label restricted/);
+  assert.match(update.content[0].text, /blocked label internal/);
   assert.equal(fetchCalls.length, 1);
 });
 
-test("list projects is scoped to allowed projects", async () => {
-  process.env.JIRA_ALLOWED_PROJECTS = "PMO";
+test("list projects excludes blocked projects", async () => {
+  process.env.JIRA_BLOCKED_PROJECTS = "ENG";
   global.fetch = async () => jsonResponse([
     { id: "1", key: "PMO", name: "PMO" },
     { id: "2", key: "ENG", name: "Engineering" }

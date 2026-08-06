@@ -17,7 +17,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
 
 const CONFIRMATION_TOKEN_TTL_SECONDS = 600;
 const CODEX_ATTRIBUTION_LABEL = "codex-assisted";
-const DEFAULT_BLOCKED_LABELS = ["sensitive", "restricted", "phi", "pii", "security"];
+const DEFAULT_BLOCKED_LABELS = ["sensitive", "internal"];
 const GUARDRAIL_ISSUE_FIELDS = ["project", "labels", "security"];
 
 const DEFAULT_SEARCH_FIELDS = [
@@ -697,7 +697,9 @@ async function jiraListProjects(args) {
     }
   });
   const projects = Array.isArray(data) ? data : [];
-  const visibleProjects = projects.filter((project) => isAllowedProject(config, project.key));
+  const visibleProjects = projects.filter((project) =>
+    config.blockedProjects.length === 0 || (project.key && !isProjectBlocked(config, project.key))
+  );
   const normalized = visibleProjects.slice(0, limit).map((project) => ({
     id: project.id ?? null,
     key: project.key ?? null,
@@ -737,7 +739,7 @@ async function jiraCreateIssue(args) {
   const issueType = requiredString(args.issueType, "issueType");
   const summary = requiredString(args.summary, "summary");
   const codexAttribution = args.codexAttribution !== false;
-  assertAllowedProject(config, projectKey, "Jira issue create");
+  assertProjectNotBlocked(config, projectKey, "Jira issue create");
   const fields = {
     project: { key: projectKey },
     issuetype: { name: issueType },
@@ -1064,7 +1066,7 @@ function readConfig() {
     authSecret: authMode === "basic" ? password ?? apiToken : token,
     defaultProjectKey: stringOrUndefined(process.env.JIRA_PROJECT_KEY),
     defaultJqlFilter: stringOrUndefined(process.env.JIRA_JQL_FILTER),
-    allowedProjects: parseCsvEnv(process.env.JIRA_ALLOWED_PROJECTS),
+    blockedProjects: parseCsvEnv(process.env.JIRA_BLOCKED_PROJECTS),
     blockedLabels: parseCsvEnv(process.env.JIRA_BLOCKED_LABELS, DEFAULT_BLOCKED_LABELS)
   };
 }
@@ -1101,7 +1103,7 @@ function buildSearchJql(config, { query, rawJql, projectKey }) {
 
   const clauses = [`text ~ "${escapeJqlString(query)}"`];
   if (projectKey) {
-    assertAllowedProject(config, projectKey, "Jira search");
+    assertProjectNotBlocked(config, projectKey, "Jira search");
     clauses.unshift(`project = "${escapeJqlString(projectKey)}"`);
   }
   if (config.defaultJqlFilter) {
@@ -1122,9 +1124,9 @@ function applyJqlGuardrails(config, jql) {
 
   const { where, orderBy } = splitJqlOrderBy(jql);
   const clauses = where ? [`(${where})`] : [];
-  if (config.allowedProjects.length > 0) {
+  if (config.blockedProjects.length > 0) {
     clauses.push(
-      `project in (${config.allowedProjects.map((project) => `"${escapeJqlString(project)}"`).join(", ")})`
+      `project not in (${config.blockedProjects.map((project) => `"${escapeJqlString(project)}"`).join(", ")})`
     );
   }
   if (config.blockedLabels.length > 0) {
@@ -1191,31 +1193,36 @@ async function fetchIssueForGuardrails(config, issueKey) {
 }
 
 function hasJiraGuardrails(config) {
-  return config.allowedProjects.length > 0 || config.blockedLabels.length > 0;
+  return config.blockedProjects.length > 0 || config.blockedLabels.length > 0;
 }
 
-function assertAllowedProject(config, projectKey, target) {
-  if (!isAllowedProject(config, projectKey)) {
+function assertProjectNotBlocked(config, projectKey, target) {
+  if (config.blockedProjects.length === 0) {
+    return;
+  }
+  if (!projectKey) {
     throw new Error(
-      `${target} is restricted by guardrails because project ${projectKey ?? "(unknown)"} is not in JIRA_ALLOWED_PROJECTS`
+      `${target} is restricted by guardrails because its project could not be checked against JIRA_BLOCKED_PROJECTS`
+    );
+  }
+  if (isProjectBlocked(config, projectKey)) {
+    throw new Error(
+      `${target} is restricted by guardrails because project ${projectKey ?? "(unknown)"} is in JIRA_BLOCKED_PROJECTS`
     );
   }
 }
 
-function isAllowedProject(config, projectKey) {
-  if (config.allowedProjects.length === 0) {
-    return true;
-  }
+function isProjectBlocked(config, projectKey) {
   if (!projectKey) {
     return false;
   }
   const normalized = projectKey.toLowerCase();
-  return config.allowedProjects.some((allowed) => allowed.toLowerCase() === normalized);
+  return config.blockedProjects.some((blocked) => blocked.toLowerCase() === normalized);
 }
 
 function assertJiraIssueAllowed(config, issue, target) {
   const fields = issue?.fields ?? {};
-  assertAllowedProject(config, fields.project?.key ?? null, target);
+  assertProjectNotBlocked(config, fields.project?.key ?? null, target);
 
   const blockedLabel = findBlockedLabel(config, Array.isArray(fields.labels) ? fields.labels : []);
   if (blockedLabel) {
@@ -1244,7 +1251,7 @@ function isJiraIssueAllowed(config, issue) {
 function assertJiraPayloadAllowed(config, payload, target) {
   const projectKey = payload?.fields?.project?.key;
   if (projectKey) {
-    assertAllowedProject(config, projectKey, target);
+    assertProjectNotBlocked(config, projectKey, target);
   }
 
   const labels = [
