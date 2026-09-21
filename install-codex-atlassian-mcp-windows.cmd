@@ -53,7 +53,11 @@ if errorlevel 1 goto fail
 
 call :cleanup
 echo.
-echo Done. Quit and reopen Codex Desktop before using the Confluence and Jira MCP tools.
+echo Installation succeeded.
+echo Restart Codex Desktop before using the Confluence and Jira MCP tools.
+echo.
+echo Press any key to close this window.
+pause >nul
 exit /b 0
 
 :require_command
@@ -244,5 +248,9 @@ exit /b 0
 :fail
 call :cleanup
 echo.
-echo Install failed.
+echo Installation failed.
+echo Review the error message above for troubleshooting details.
+echo.
+echo Press any key to close this window.
+pause >nul
 exit /b 1
