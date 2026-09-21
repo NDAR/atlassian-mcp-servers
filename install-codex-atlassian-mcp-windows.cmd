@@ -122,7 +122,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-curl.exe -L --fail -o "%NODE_ZIP%" "%NODE_ZIP_URL%"
+curl.exe --ssl-revoke-best-effort -L --fail -o "%NODE_ZIP%" "%NODE_ZIP_URL%"
 if errorlevel 1 (
   echo Failed to download portable Node.js.
   exit /b 1
@@ -214,7 +214,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-curl.exe -L --fail -o "%REPO_ZIP%" "%REPO_ZIP_URL%"
+curl.exe --ssl-revoke-best-effort -L --fail -o "%REPO_ZIP%" "%REPO_ZIP_URL%"
 if errorlevel 1 (
   echo Failed to download MCP server files.
   exit /b 1
