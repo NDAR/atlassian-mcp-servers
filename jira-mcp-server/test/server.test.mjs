@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
+import { createHash } from "node:crypto";
+import { chmod, mkdtemp, writeFile, rm, symlink, truncate } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { TOOL_DEFINITIONS, handleToolCall } from "../src/server.mjs";
 
@@ -34,6 +38,7 @@ test("tool list includes Jira read and write tools", () => {
   assert.ok(toolNames.includes("jira_transition_issue"));
   assert.ok(toolNames.includes("jira_assign_issue"));
   assert.ok(toolNames.includes("jira_add_comment"));
+  assert.ok(toolNames.includes("jira_add_attachment"));
   assert.ok(toolNames.includes("jira_list_transitions"));
 });
 
@@ -710,3 +715,213 @@ function issueResponse({
     }
   };
 }
+
+
+async function attachmentFixture(t, bytes = Buffer.from([0, 255, 10, 13, 128])) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "jira-attachment-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, "résumé report.bin");
+  await writeFile(filePath, bytes);
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    if (options.method === "GET") return jsonResponse(issueResponse());
+    if (String(url).endsWith("/attachments")) return jsonResponse([{
+      id: "20001", filename: "résumé report.bin", size: bytes.length,
+      mimeType: "application/octet-stream", created: "2026-06-26",
+      author: { name: "tester", displayName: "Tester" },
+      self: "https://jira.example.test/rest/api/2/attachment/20001",
+      content: "https://jira.example.test/secure/attachment/20001/report.bin"
+    }]);
+    return jsonResponse({ id: "30001", body: JSON.parse(options.body).body });
+  };
+  return { args: { issueKey: "ENG-42", filePath }, calls, bytes, dir };
+}
+
+test("attachment preview contains metadata and digest without posting or exposing contents", async (t) => {
+  const { args, calls, bytes } = await attachmentFixture(t);
+  const result = parseToolJson(await callTool("jira_add_attachment", args));
+  assert.equal(result.dryRun, true);
+  assert.equal(result.attachment.filename, "résumé report.bin");
+  assert.equal(result.attachment.size, bytes.length);
+  assert.equal(result.attachment.sha256, createHash("sha256").update(bytes).digest("hex"));
+  assert.match(result.auditComment, /Codex.*attached/);
+  assert.ok(result.confirmationToken);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.method, "GET");
+  assert.equal(result.attachment.bytes, undefined);
+});
+
+test("attachment execution sends exact bytes with multipart boundary and attribution", async (t) => {
+  const { args, calls, bytes } = await attachmentFixture(t);
+  const preview = parseToolJson(await callTool("jira_add_attachment", args));
+  const result = parseToolJson(await callTool("jira_add_attachment", {
+    ...args, dryRun: false, confirmationToken: preview.confirmationToken
+  }));
+  const upload = calls.find((call) => call.url.endsWith("/attachments"));
+  assert.equal(upload.url, "https://jira.example.test/rest/api/2/issue/ENG-42/attachments");
+  assert.equal(upload.options.headers.Authorization, "Bearer test-token");
+  assert.equal(upload.options.headers["X-Atlassian-Token"], "no-check");
+  assert.equal(upload.options.headers["Content-Type"], undefined);
+  const request = new Request(upload.url, upload.options);
+  assert.match(request.headers.get("content-type"), /^multipart\/form-data; boundary=/);
+  const form = await request.formData();
+  assert.equal([...form.keys()].join(","), "file");
+  assert.equal(form.get("file").name, "résumé report.bin");
+  assert.deepEqual(Buffer.from(await form.get("file").arrayBuffer()), bytes);
+  assert.equal(result.executed, true);
+  assert.equal(result.result.attachment.id, "20001");
+  assert.equal(result.result.attachment.author.displayName, "Tester");
+  assert.match(result.result.attachment.contentUrl, /20001/);
+  assert.equal(result.result.auditComment.id, "30001");
+  assert.equal(calls.filter((call) => call.options.method === "POST").length, 2);
+});
+
+test("attachment supports basic auth, custom metadata, symlinks, and suppressed attribution", async (t) => {
+  const { args, calls, dir } = await attachmentFixture(t, Buffer.alloc(0));
+  process.env.JIRA_AUTH_MODE = "basic";
+  process.env.JIRA_USERNAME = "user";
+  process.env.JIRA_PASSWORD = "secret";
+  process.env.JIRA_API_PATH = "/jira/rest/api/2";
+  const link = process.platform === "win32" ? args.filePath : path.join(dir, "link.txt");
+  if (process.platform !== "win32") await symlink(args.filePath, link);
+  const input = { ...args, filePath: link, filename: "custom.txt", mimeType: "text/plain", codexAttribution: false };
+  const preview = parseToolJson(await callTool("jira_add_attachment", input));
+  assert.equal(preview.attachment.filePath, args.filePath);
+  const result = parseToolJson(await callTool("jira_add_attachment", {
+    ...input, dryRun: false, confirmationToken: preview.confirmationToken
+  }));
+  const upload = calls.find((call) => call.url.endsWith("/attachments"));
+  assert.match(upload.url, /\/jira\/rest\/api\/2\//);
+  assert.equal(upload.options.headers.Authorization, `Basic ${Buffer.from("user:secret").toString("base64")}`);
+  assert.equal(upload.options.body.get("file").name, "custom.txt");
+  assert.equal(upload.options.body.get("file").type, "text/plain");
+  assert.equal(result.result.auditComment, null);
+  assert.equal(calls.filter((call) => call.options.method === "POST").length, 1);
+});
+
+test("attachment rejects missing, expired and mismatched confirmations without posting", async (t) => {
+  const { args, calls } = await attachmentFixture(t);
+  const preview = parseToolJson(await callTool("jira_add_attachment", args));
+  const otherPath = args.filePath + ".copy";
+  await writeFile(otherPath, Buffer.from([0, 255, 10, 13, 128]));
+  for (const override of [
+    { confirmationToken: undefined }, { issueKey: "ENG-43" },
+    { filePath: otherPath },
+    { filename: "changed.bin" }, { mimeType: "image/png" }, { codexAttribution: false }
+  ]) {
+    const result = await callTool("jira_add_attachment", {
+      ...args, dryRun: false, confirmationToken: preview.confirmationToken, ...override
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /confirmationToken/);
+  }
+  Date.now = () => Date.parse("2026-06-26T12:10:01.000Z");
+  const expired = await callTool("jira_add_attachment", { ...args, dryRun: false, confirmationToken: preview.confirmationToken });
+  assert.match(expired.content[0].text, /expired/);
+  Date.now = () => Date.parse("2026-06-26T12:00:00.000Z");
+  await writeFile(args.filePath, Buffer.from([1, 2, 3, 4, 5]));
+  const changed = await callTool("jira_add_attachment", { ...args, dryRun: false, confirmationToken: preview.confirmationToken });
+  assert.match(changed.content[0].text, /does not match/);
+  assert.equal(calls.filter((call) => call.options.method === "POST").length, 0);
+});
+
+test("attachment rejects invalid paths, metadata, and size configuration", async (t) => {
+  const { args, calls, dir } = await attachmentFixture(t);
+  for (const override of [
+    { filePath: "relative.txt" }, { filePath: dir }, { filePath: path.join(dir, "missing") },
+    { filename: "../bad" }, { filename: "bad\\name" }, { filename: "bad\nname" },
+    { filename: ".." }, { filename: "" }, { mimeType: "text/plain\r\nx: y" }
+  ]) {
+    const result = await callTool("jira_add_attachment", { ...args, ...override });
+    assert.equal(result.isError, true, JSON.stringify(override));
+  }
+  for (const limit of ["0", "-1", "bad", "1.5", "9007199254740992", ""]) {
+    process.env.JIRA_ATTACHMENT_MAX_BYTES = limit;
+    const result = await callTool("jira_add_attachment", args);
+    assert.match(result.content[0].text, /JIRA_ATTACHMENT_MAX_BYTES/);
+  }
+  process.env.JIRA_ATTACHMENT_MAX_BYTES = "4";
+  const oversized = await callTool("jira_add_attachment", args);
+  assert.match(oversized.content[0].text, /exceeds/);
+  process.env.JIRA_ATTACHMENT_MAX_BYTES = "5";
+  assert.equal(parseToolJson(await callTool("jira_add_attachment", args)).attachment.size, 5);
+  assert.equal(calls.filter((call) => call.options.method === "POST").length, 0);
+});
+
+test("attachment guardrails run before file access and are rechecked on execution", async (t) => {
+  const { args, calls } = await attachmentFixture(t);
+  const preview = parseToolJson(await callTool("jira_add_attachment", args));
+  for (const blocked of [
+    { projectKey: "SEC" }, { labels: ["sensitive"] }, { security: { name: "Internal" } }
+  ]) {
+    process.env.JIRA_BLOCKED_PROJECTS = "SEC";
+    global.fetch = async () => jsonResponse(issueResponse(blocked));
+    for (const input of [
+      { ...args, filePath: args.filePath + ".missing" },
+      { ...args, dryRun: false, confirmationToken: preview.confirmationToken }
+    ]) {
+      const result = await callTool("jira_add_attachment", input);
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /restricted by guardrails/);
+      assert.doesNotMatch(result.content[0].text, /ENOENT/);
+    }
+  }
+  assert.equal(calls.filter((call) => call.options.method === "POST").length, 0);
+});
+
+test("attachment enforces the default size limit before reading a large file", async (t) => {
+  const { args } = await attachmentFixture(t);
+  delete process.env.JIRA_ATTACHMENT_MAX_BYTES;
+  await truncate(args.filePath, 25 * 1024 * 1024 + 1);
+  const result = await callTool("jira_add_attachment", args);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /exceeds.*26214400/);
+});
+
+test("attachment reports unreadable files", async (t) => {
+  if (process.platform === "win32" || process.getuid?.() === 0) {
+    t.skip("POSIX file permission test requires a non-root POSIX user");
+    return;
+  }
+  const { args } = await attachmentFixture(t);
+  await chmod(args.filePath, 0);
+  const result = await callTool("jira_add_attachment", args);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /EACCES|permission denied/i);
+});
+
+test("attachment reports Jira and transport failures without retrying", async (t) => {
+  const { args } = await attachmentFixture(t);
+  const preview = parseToolJson(await callTool("jira_add_attachment", args));
+  for (const status of [400, 401, 403, 404, 413, 500, "transport", "invalid-response"]) {
+    let posts = 0;
+    global.fetch = async (url, options) => {
+      if (options.method === "GET") return jsonResponse(issueResponse());
+      posts++;
+      if (status === "transport") throw new Error("connection reset");
+      if (status === "invalid-response") return jsonResponse({});
+      return jsonResponse({ errorMessages: ["Attachments disabled or rejected"] }, status);
+    };
+    const result = await callTool("jira_add_attachment", { ...args, dryRun: false, confirmationToken: preview.confirmationToken });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /[Cc]heck.*Jira/);
+    if (typeof status === "number") assert.match(result.content[0].text, new RegExp(String(status)));
+    assert.equal(posts, 1);
+  }
+});
+
+test("audit comment failure preserves attachment success and warns against retry", async (t) => {
+  const { args } = await attachmentFixture(t);
+  const fetchAttachment = global.fetch;
+  global.fetch = async (url, options) => String(url).endsWith("/comment")
+    ? jsonResponse({ errorMessages: ["Comment permission denied"] }, 403)
+    : fetchAttachment(url, options);
+  const preview = parseToolJson(await callTool("jira_add_attachment", args));
+  const result = await callTool("jira_add_attachment", { ...args, dryRun: false, confirmationToken: preview.confirmationToken });
+  assert.equal(result.isError, undefined);
+  const value = parseToolJson(result);
+  assert.equal(value.executed, true);
+  assert.equal(value.result.attachment.id, "20001");
+  assert.match(value.result.warning, /uploaded successfully.*Comment permission denied.*Do not retry/);
+});

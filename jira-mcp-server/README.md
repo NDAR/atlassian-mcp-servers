@@ -14,6 +14,7 @@ A standalone MCP server that exposes Jira issue/project lookup and write tools o
 - `jira_list_transitions`: list available workflow transitions for a Jira issue
 - `jira_assign_issue`: dry-run or assign, reassign, or unassign a Jira issue
 - `jira_add_comment`: dry-run or add a Jira issue comment
+- `jira_add_attachment`: dry-run or upload one local file to a Jira issue
 
 This implementation uses Node's built-in `fetch` and does not require external packages.
 
@@ -21,7 +22,7 @@ This implementation uses Node's built-in `fetch` and does not require external p
 
 - Node 18+ (`v22` is available in this workspace)
 - A Jira account, personal access token, or basic-auth credentials with read access
-- Write-capable tools require Jira permissions to create issues, edit issues, transition issues, assign issues, or add comments
+- Write-capable tools require Jira permissions to create issues, edit issues, transition issues, assign issues, add comments, or create attachments. Uploads require attachments to be enabled in Jira; attribution comments also require permission to add comments.
 
 ## Configuration
 
@@ -37,12 +38,13 @@ Copy `.env.example` into your client-side environment configuration and set:
 - `JIRA_JQL_FILTER`: optional JQL appended to generated searches
 - `JIRA_BLOCKED_PROJECTS`: optional comma-separated project blocklist enforced on all reads and writes. An empty value blocks no projects.
 - `JIRA_BLOCKED_LABELS`: optional comma-separated labels and issue security level names to block. Defaults to `sensitive,internal`
+- `JIRA_ATTACHMENT_MAX_BYTES`: optional positive integer upload limit in bytes. Defaults to `26214400` (25 MiB). Jira may impose a smaller limit.
 
 The write tools do not use a separate enable flag. If the configured account can write in Jira, the tools can write after their dry-run confirmation step.
 
 ## Guardrails
 
-Use `JIRA_BLOCKED_PROJECTS` to deny access to specific Jira projects. When it is set, every search, issue fetch, project list, issue create, issue update, transition, assignment, and comment is checked against that blocklist. Raw JQL is still allowed, but the server wraps it with a `project not in (...)` condition so callers cannot bypass the blocklist. Leave it empty to allow all projects visible to the configured Jira account.
+Use `JIRA_BLOCKED_PROJECTS` to deny access to specific Jira projects. When it is set, every search, issue fetch, project list, issue create, issue update, transition, assignment, comment, and attachment upload is checked against that blocklist. Raw JQL is still allowed, but the server wraps it with a `project not in (...)` condition so callers cannot bypass the blocklist. Leave it empty to allow all projects visible to the configured Jira account.
 
 Issues with labels listed in `JIRA_BLOCKED_LABELS` are blocked. If Jira returns an issue security level, matching security level names or descriptions are blocked too. The server requests project, label, and security metadata before returning issue descriptions or building write previews for existing issues.
 
@@ -94,6 +96,7 @@ Codex attribution is enabled by default for write tools:
 - `jira_create_issue` adds the `codex-assisted` label and appends `Created with Codex via Jira MCP on <date> at the user's request.` to the description.
 - `jira_update_issue`, `jira_transition_issue`, and `jira_assign_issue` add a Jira audit comment describing the action.
 - `jira_add_comment` appends `Posted with Codex via Jira MCP.` to the comment body.
+- `jira_add_attachment` adds an audit comment identifying the uploaded filename. A comment failure returns successful attachment metadata with a warning; do not upload the file again.
 
 Set `codexAttribution: false` on any write tool to suppress labels, footers, and audit comments when exact text or fields are required.
 
@@ -192,6 +195,40 @@ To unassign:
   "body": "Looks good."
 }
 ```
+
+### Add attachment
+
+Preview one file:
+
+```json
+{
+  "issueKey": "ENG-123",
+  "filePath": "/absolute/path/to/report.pdf",
+  "mimeType": "application/pdf"
+}
+```
+
+The path must be absolute and accessible to the MCP process. Windows paths work on Windows, for example `"C:\\Users\\you\\Documents\\report.pdf"`. Readable regular files and symlinks to regular files are supported. Relative paths and directories are rejected. The optional `filename` overrides the uploaded name and defaults to the source basename; it cannot contain path separators or control characters. The MIME type defaults to `application/octet-stream`.
+
+The preview includes the resolved path, filename, MIME type, byte count, SHA-256 digest, attribution comment, and a ten-minute confirmation token. It does not return file contents or upload anything. The server checks the issue's project, labels, and security restrictions before reading the file on both preview and execution.
+
+Execute with the same arguments and the preview's token:
+
+```json
+{
+  "issueKey": "ENG-123",
+  "filePath": "/absolute/path/to/report.pdf",
+  "mimeType": "application/pdf",
+  "dryRun": false,
+  "confirmationToken": "paste-token-from-dry-run"
+}
+```
+
+Changing the issue, resolved source path, file bytes, filename, MIME type, or attribution requires a new preview. Successful execution returns the issue URL and attachment metadata, including its ID and content URL. Set `codexAttribution: false` in both calls to suppress the audit comment. Each call uploads one file; listing, downloading, and deleting attachments are not provided by this tool.
+
+Uploads are never automatically retried. A transport failure can leave the outcome uncertain: inspect the issue's attachments in Jira before retrying to avoid duplicates. If the upload succeeds but its attribution comment fails, the tool returns `executed: true`, attachment metadata, and a warning. Do not retry that upload.
+
+To enable the new tool in an existing installation, update the server source referenced by Codex (including any Windows installed copy) and restart Codex. No installer changes are necessary.
 
 ## Example MCP client config
 

@@ -5,11 +5,15 @@ Standalone MCP servers for Data Center Atlassian services.
 ## Servers
 
 - `confluence-mcp-server`: Confluence search, page fetch, page create/update, and comment tools
-- `jira-mcp-server`: Jira issue/project lookup, issue create/update, transition, assignment, and comment tools
+- `jira-mcp-server`: Jira issue/project lookup, issue create/update, transition, assignment, comment, and local-file attachment tools
 
 Each server is dependency-free and uses Node's built-in `fetch`.
 
 Both servers include write-capable tools. Write tools default to dry-run mode and require a second call with a matching `confirmationToken` before they create or update anything.
+
+To attach a file, ask Codex to attach an absolute local file path to a Jira issue. The `jira_add_attachment` tool previews one file per call, then uploads it after confirmation. Files must be accessible to the local Jira MCP process. The default limit is 25 MiB; set `JIRA_ATTACHMENT_MAX_BYTES` under `[mcp_servers.jira.env]` to change it. Jira may enforce a smaller limit.
+
+When upgrading an existing installation, update the server source at the path configured in Codex (or update the installed copy on Windows), then quit and reopen Codex so it discovers the new tool. No installer or credential changes are required. See the [Jira README](./jira-mcp-server/README.md#add-attachment) for the upload flow and retry guidance.
 
 ## Simple Codex Desktop Setup
 
