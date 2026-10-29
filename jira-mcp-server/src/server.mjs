@@ -1,5 +1,8 @@
-import { Buffer } from "node:buffer";
+import { Blob, Buffer } from "node:buffer";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { constants } from "node:fs";
+import { open, realpath, stat } from "node:fs/promises";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const SERVER_INFO = {
@@ -44,6 +47,24 @@ const DEFAULT_ISSUE_FIELDS = [
 ];
 
 export const TOOL_DEFINITIONS = [
+  {
+    name: "jira_add_attachment",
+    description: "Dry-run or upload one local file to a Jira issue. File paths must be accessible to the MCP server. Never automatically retry an upload after a transport failure; check Jira first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueKey: { type: "string", description: "Jira issue key or ID." },
+        filePath: { type: "string", description: "Absolute path to a readable regular file on the MCP server's filesystem." },
+        filename: { type: "string", description: "Optional upload filename; defaults to the source file's basename." },
+        mimeType: { type: "string", description: "Optional MIME type; defaults to application/octet-stream." },
+        codexAttribution: { type: "boolean", description: "Default true. Set false to suppress the Codex audit comment." },
+        dryRun: { type: "boolean", description: "Default true. Set false to execute with a valid confirmationToken." },
+        confirmationToken: { type: "string", description: "Token returned by a matching dry-run preview." }
+      },
+      required: ["issueKey", "filePath"],
+      additionalProperties: false
+    }
+  },
   {
     name: "jira_search",
     description: "Search Jira issues by free-text query or raw JQL.",
@@ -587,6 +608,8 @@ export async function handleToolCall(params) {
   const args = params.arguments ?? {};
 
   switch (toolName) {
+    case "jira_add_attachment":
+      return await runToolSafely(() => jiraAddAttachment(args));
     case "jira_search":
       return await runToolSafely(() => jiraSearch(args));
     case "jira_get_issue":
@@ -952,6 +975,104 @@ async function jiraAssignIssue(args) {
         ? await postJiraComment(config, issueKey, auditComment)
         : null;
       return normalizeMutationResult(config.baseUrl, issueKey, { auditComment: audit });
+    }
+  });
+}
+
+async function readAttachment(filePath, maxBytes) {
+  const resolvedPath = await realpath(filePath);
+  if (!(await stat(resolvedPath)).isFile()) {
+    throw new Error("filePath must identify a regular file");
+  }
+  const handle = await open(resolvedPath, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) {
+      throw new Error("filePath must identify a regular file");
+    }
+    if (metadata.size > maxBytes) {
+      throw new Error(`Attachment exceeds JIRA_ATTACHMENT_MAX_BYTES (${maxBytes} bytes)`);
+    }
+    const chunks = [];
+    let size = 0;
+    while (true) {
+      const chunk = Buffer.alloc(Math.min(65536, maxBytes - size + 1));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      size += bytesRead;
+      if (size > maxBytes) {
+        throw new Error(`Attachment exceeds JIRA_ATTACHMENT_MAX_BYTES (${maxBytes} bytes)`);
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    return { resolvedPath, bytes: Buffer.concat(chunks, size) };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function jiraAddAttachment(args) {
+  const config = readConfig();
+  const issueKey = requiredString(args.issueKey, "issueKey");
+  const filePath = requiredString(args.filePath, "filePath");
+  if (!path.isAbsolute(filePath)) throw new Error("filePath must be absolute");
+  const filename = args.filename === undefined ? path.basename(filePath) : requiredString(args.filename, "filename");
+  if (filename === "." || filename === ".." || /[\\/\x00-\x1f\x7f]/.test(filename)) {
+    throw new Error("filename must be a single filename without path separators or control characters");
+  }
+  const mimeType = args.mimeType === undefined ? "application/octet-stream" : requiredString(args.mimeType, "mimeType");
+  if (!/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(mimeType)) {
+    throw new Error("mimeType must be a valid type/subtype");
+  }
+  const rawLimit = process.env.JIRA_ATTACHMENT_MAX_BYTES ?? String(25 * 1024 * 1024);
+  const maxBytes = Number(rawLimit);
+  if (!/^\d+$/.test(rawLimit) || !Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error("JIRA_ATTACHMENT_MAX_BYTES must be a positive safe integer");
+  }
+  await fetchIssueForGuardrails(config, issueKey);
+  const { resolvedPath, bytes } = await readAttachment(filePath, maxBytes);
+  const attachment = { filePath: resolvedPath, filename, mimeType, size: bytes.length, sha256: sha256Hex(bytes) };
+  const auditComment = args.codexAttribution === false
+    ? null
+    : `Codex via Jira MCP attached ${filename} to this issue on ${currentDateString()}.`;
+  const endpointPath = `/issue/${encodeURIComponent(issueKey)}/attachments`;
+  const tokenPayload = buildTokenPayload({
+    operation: "jira_add_attachment", method: "POST", endpointPath,
+    target: { issueKey }, payload: attachment, auditComment
+  });
+  const preview = { ...buildWritePreview(config, tokenPayload), attachment, auditComment };
+  return await previewOrExecuteWrite({
+    config, args, tokenPayload, preview,
+    execute: async () => {
+      const form = new FormData();
+      form.append("file", new Blob([bytes], { type: mimeType }), filename);
+      let uploaded;
+      try {
+        uploaded = await jiraRequest(config, endpointPath, { method: "POST", body: form });
+      } catch (error) {
+        throw new Error(`${error.message} Upload was not retried. If the outcome is uncertain, check the issue's attachments in Jira before retrying.`);
+      }
+      if (!Array.isArray(uploaded) || uploaded.length !== 1 || !uploaded[0]?.id) {
+        throw new Error("Jira returned unexpected attachment metadata; the upload may have succeeded. Check Jira before retrying.");
+      }
+      const item = uploaded[0];
+      const result = {
+        issueKey, url: buildIssueUrl(config.baseUrl, issueKey),
+        attachment: {
+          id: item.id, filename: item.filename ?? null, size: item.size ?? null,
+          mimeType: item.mimeType ?? null, created: item.created ?? null,
+          author: normalizeUser(item.author), apiUrl: item.self ?? null, contentUrl: item.content ?? null
+        },
+        auditComment: null
+      };
+      if (auditComment) {
+        try {
+          result.auditComment = await postJiraComment(config, issueKey, auditComment);
+        } catch (error) {
+          result.warning = `Attachment uploaded successfully, but the Codex audit comment failed: ${error.message}. Do not retry the upload.`;
+        }
+      }
+      return result;
     }
   });
 }
@@ -1562,7 +1683,10 @@ async function jiraRequest(config, endpointPath, options = {}) {
     Accept: "application/json"
   };
 
-  if (options.body !== undefined) {
+  const isMultipart = options.body instanceof FormData;
+  if (isMultipart) {
+    headers["X-Atlassian-Token"] = "no-check";
+  } else if (options.body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
 
@@ -1579,7 +1703,7 @@ async function jiraRequest(config, endpointPath, options = {}) {
   const response = await fetch(url, {
     method: options.method ?? "GET",
     headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
+    body: options.body === undefined ? undefined : isMultipart ? options.body : JSON.stringify(options.body)
   });
   const rawText = await response.text();
   const parsedBody = tryParseJson(rawText);
