@@ -6,6 +6,7 @@ A standalone MCP server that exposes Jira issue/project lookup and write tools o
 
 - `jira_search`: search Jira issues by free text or raw JQL
 - `jira_get_issue`: fetch a Jira issue by key or ID
+- `jira_list_comments`: read one page of comments on a Jira issue
 - `jira_list_projects`: list Jira projects visible to the configured account
 - `jira_myself`: return the current Jira user, useful for credential checks
 - `jira_create_issue`: dry-run or create a Jira issue
@@ -44,7 +45,7 @@ The write tools do not use a separate enable flag. If the configured account can
 
 ## Guardrails
 
-Use `JIRA_BLOCKED_PROJECTS` to deny access to specific Jira projects. When it is set, every search, issue fetch, project list, issue create, issue update, transition, assignment, comment, and attachment upload is checked against that blocklist. Raw JQL is still allowed, but the server wraps it with a `project not in (...)` condition so callers cannot bypass the blocklist. Leave it empty to allow all projects visible to the configured Jira account.
+Use `JIRA_BLOCKED_PROJECTS` to deny access to specific Jira projects. When it is set, every search, issue fetch, project list, comment read, issue create, issue update, transition, assignment, comment post, and attachment upload is checked against that blocklist. Raw JQL is still allowed, but the server wraps it with a `project not in (...)` condition so callers cannot bypass the blocklist. Leave it empty to allow all projects visible to the configured Jira account.
 
 Issues with labels listed in `JIRA_BLOCKED_LABELS` are blocked. If Jira returns an issue security level, matching security level names or descriptions are blocked too. The server requests project, label, and security metadata before returning issue descriptions or building write previews for existing issues.
 
@@ -82,6 +83,26 @@ JIRA_PASSWORD=...
 cd /Users/kimny/src/mcp/jira-mcp-server
 npm run start
 ```
+
+## Read Comments
+
+Use `jira_list_comments` to read existing comments. `jira_get_issue` does not return comments, even when its `fields` argument includes `comment`.
+
+```json
+{
+  "issueKey": "ENG-123",
+  "startAt": 0,
+  "maxResults": 10
+}
+```
+
+Only `issueKey` is required. `startAt` defaults to `0`; `maxResults` defaults to `10` and is capped at `50`. The tool returns the issue key and URL, Jira's `startAt`, `maxResults`, and `total`, the actual returned `count`, and `comments`. Each comment includes its ID, author, creation/update timestamps, original string body, API URL, and visibility restriction metadata when available (`null` otherwise). Jira's ordering and account permissions determine which comments are returned.
+
+One call retrieves one page. While `startAt + count < total`, request the next page with `startAt` set to the previous `startAt + count`. For example, after receiving 10 comments starting at 0, request `{"issueKey":"ENG-123","startAt":10,"maxResults":10}`. Stop if a page is empty to avoid looping if comments change between calls. A zero `total` means no visible comments; `total: null` means Jira omitted the total and the tool cannot assert completeness.
+
+The server checks the issue's project, labels, and security restrictions before requesting comments on every page. Reading comments does not require a confirmation token and never posts an attribution comment. Editing/deleting comments and fetching a single comment by ID are not provided.
+
+After updating the configured server source (or installed copy), quit and reopen Codex to discover `jira_list_comments`.
 
 ## Write Safety Flow
 

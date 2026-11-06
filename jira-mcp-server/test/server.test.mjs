@@ -33,6 +33,7 @@ test("tool list includes Jira read and write tools", () => {
 
   assert.ok(toolNames.includes("jira_search"));
   assert.ok(toolNames.includes("jira_get_issue"));
+  assert.ok(toolNames.includes("jira_list_comments"));
   assert.ok(toolNames.includes("jira_create_issue"));
   assert.ok(toolNames.includes("jira_update_issue"));
   assert.ok(toolNames.includes("jira_transition_issue"));
@@ -652,6 +653,128 @@ test("existing read tools still work", async () => {
   assert.equal(search.issues[0].key, "ENG-42");
   assert.equal(issue.key, "ENG-42");
   assert.equal(issue.description, "Description");
+});
+
+test("list comments checks issue guardrails then returns normalized comments and pagination", async () => {
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    if (calls.length === 1) return jsonResponse(issueResponse());
+    return jsonResponse({ startAt: 0, maxResults: 10, total: 11, comments: [{
+      id: "501", author: { name: "reader", displayName: "Reader" },
+      created: "2026-11-06T10:00:00Z", updated: "2026-11-06T11:00:00Z",
+      body: "First line\n*Jira markup* and Unicode: café",
+      self: "https://jira.example.test/rest/api/2/issue/ENG-42/comment/501",
+      visibility: { type: "role", value: "Developers" }
+    }] });
+  };
+  const result = parseToolJson(await callTool("jira_list_comments", { issueKey: "ENG-42" }));
+  assert.equal(calls.length, 2);
+  assert.equal(new URL(calls[0].url).searchParams.get("fields"), "project,labels,security");
+  assert.equal(calls[1].url, "https://jira.example.test/rest/api/2/issue/ENG-42/comment?startAt=0&maxResults=10");
+  for (const call of calls) {
+    assert.equal(call.options.method, "GET");
+    assert.equal(call.options.headers.Authorization, "Bearer test-token");
+    assert.equal(call.options.body, undefined);
+  }
+  assert.equal(result.issueKey, "ENG-42");
+  assert.equal(result.url, "https://jira.example.test/browse/ENG-42");
+  assert.equal(result.startAt, 0);
+  assert.equal(result.maxResults, 10);
+  assert.equal(result.total, 11);
+  assert.equal(result.count, 1);
+  assert.equal(result.comments[0].id, "501");
+  assert.equal(result.comments[0].author.displayName, "Reader");
+  assert.equal(result.comments[0].body, "First line\n*Jira markup* and Unicode: café");
+  assert.equal(result.comments[0].created, "2026-11-06T10:00:00Z");
+  assert.equal(result.comments[0].updated, "2026-11-06T11:00:00Z");
+  assert.match(result.comments[0].apiUrl, /\/comment\/501$/);
+  assert.deepEqual(result.comments[0].visibility, { type: "role", value: "Developers" });
+});
+
+test("list comments supports subsequent pages, server page limits, and empty results", async () => {
+  process.env.JIRA_AUTH_MODE = "basic";
+  process.env.JIRA_USERNAME = "reader";
+  process.env.JIRA_PASSWORD = "secret";
+  process.env.JIRA_API_PATH = "/jira/rest/api/2";
+  const offsets = [];
+  global.fetch = async (url, options) => {
+    assert.equal(options.headers.Authorization, `Basic ${Buffer.from("reader:secret").toString("base64")}`);
+    if (!url.pathname.endsWith("/comment")) return jsonResponse(issueResponse());
+    assert.equal(url.pathname, "/jira/rest/api/2/issue/ENG-42/comment");
+    assert.equal(url.searchParams.get("maxResults"), "50");
+    const startAt = Number(url.searchParams.get("startAt"));
+    offsets.push(startAt);
+    return jsonResponse({ startAt, maxResults: 2, total: 3,
+      comments: startAt < 3 ? [{ id: String(startAt), body: "Page comment" }] : [] });
+  };
+  for (const startAt of [0, 2, 3, 100]) {
+    const result = parseToolJson(await callTool("jira_list_comments", { issueKey: "ENG-42", startAt, maxResults: 50 }));
+    assert.equal(result.startAt, startAt);
+    assert.equal(result.maxResults, 2);
+    assert.equal(result.total, 3);
+    assert.equal(result.count, startAt < 3 ? 1 : 0);
+    if (result.count) assert.equal(result.comments[0].visibility, null);
+  }
+  assert.deepEqual(offsets, [0, 2, 3, 100]);
+  global.fetch = async (url) => jsonResponse(url.pathname.endsWith("/comment")
+    ? { startAt: 0, maxResults: 10, total: 0, comments: [] } : issueResponse());
+  const empty = parseToolJson(await callTool("jira_list_comments", { issueKey: "ENG-42" }));
+  assert.equal(empty.total, 0);
+  assert.deepEqual(empty.comments, []);
+});
+
+test("list comments validates its target and bounds pagination using existing conventions", async () => {
+  const calls = [];
+  global.fetch = async (url) => {
+    calls.push(String(url));
+    return jsonResponse(url.pathname.endsWith("/comment")
+      ? { comments: [] } : issueResponse());
+  };
+  const missing = await callTool("jira_list_comments", {});
+  assert.equal(missing.isError, true);
+  assert.match(missing.content[0].text, /issueKey is required/);
+  assert.equal(calls.length, 0);
+  await callTool("jira_list_comments", { issueKey: "ENG-42", startAt: -1, maxResults: 100 });
+  assert.match(calls[1], /startAt=0&maxResults=50$/);
+  const fallback = parseToolJson(await callTool("jira_list_comments", { issueKey: "ENG-42", maxResults: 0 }));
+  assert.equal(fallback.maxResults, 1);
+  assert.equal(fallback.total, null);
+  await callTool("jira_list_comments", { issueKey: "ENG/42", startAt: 100001 });
+  assert.match(calls.at(-1), /issue\/ENG%2F42\/comment\?startAt=100001/);
+});
+
+test("list comments blocks restricted issues before fetching comment bodies", async () => {
+  process.env.JIRA_BLOCKED_PROJECTS = "SEC";
+  for (const blocked of [
+    { projectKey: "SEC" }, { projectKey: null }, { labels: ["sensitive"] },
+    { security: { name: "Internal" } }, { security: { description: "sensitive" } }
+  ]) {
+    let calls = 0;
+    global.fetch = async () => { calls++; return jsonResponse(issueResponse(blocked)); };
+    const result = await callTool("jira_list_comments", { issueKey: "ENG-42" });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /restricted by guardrails/);
+    assert.equal(calls, 1);
+  }
+});
+
+test("list comments surfaces errors from both issue lookup and comment retrieval", async () => {
+  for (const phase of ["issue", "comment"]) {
+    for (const status of [401, 403, 404, 500, "transport"]) {
+      let calls = 0;
+      global.fetch = async (url) => {
+        calls++;
+        if (phase === "comment" && !url.pathname.endsWith("/comment")) return jsonResponse(issueResponse());
+        if (status === "transport") throw new Error("connection reset");
+        return jsonResponse({ errorMessages: ["Cannot read issue comments"] }, status);
+      };
+      const result = await callTool("jira_list_comments", { issueKey: "ENG-42" });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, status === "transport" ? /connection reset/ : new RegExp(`${status}.*Cannot read issue comments`));
+      assert.equal(calls, phase === "issue" ? 1 : 2);
+    }
+  }
 });
 
 async function callTool(name, args) {

@@ -136,6 +136,20 @@ export const TOOL_DEFINITIONS = [
     }
   },
   {
+    name: "jira_list_comments",
+    description: "Read one page of comments visible to the configured account on a Jira issue. Use startAt and the returned pagination metadata to retrieve subsequent pages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueKey: { type: "string", description: "Jira issue key or ID, for example PROJ-123." },
+        startAt: { type: "integer", minimum: 0, description: "Zero-based comment offset. Default is 0." },
+        maxResults: { type: "integer", minimum: 1, maximum: 50, description: "Maximum number of comments to request. Default is 10." }
+      },
+      required: ["issueKey"],
+      additionalProperties: false
+    }
+  },
+  {
     name: "jira_list_projects",
     description: "List Jira projects visible to the configured account.",
     inputSchema: {
@@ -614,6 +628,8 @@ export async function handleToolCall(params) {
       return await runToolSafely(() => jiraSearch(args));
     case "jira_get_issue":
       return await runToolSafely(() => jiraGetIssue(args));
+    case "jira_list_comments":
+      return await runToolSafely(() => jiraListComments(args));
     case "jira_list_projects":
       return await runToolSafely(() => jiraListProjects(args));
     case "jira_myself":
@@ -709,6 +725,33 @@ async function jiraGetIssue(args) {
   assertJiraIssueAllowed(config, data, `Jira issue ${issueKey}`);
 
   return jsonContent(normalizeIssue(config.baseUrl, data, { includeDescription: true }));
+}
+
+async function jiraListComments(args) {
+  const config = readConfig();
+  const issueKey = requiredString(args.issueKey, "issueKey");
+  const startAt = clampInteger(args.startAt, 0, 0, Number.MAX_SAFE_INTEGER);
+  const maxResults = clampInteger(args.maxResults, 10, 1, 50);
+  await fetchIssueForGuardrails(config, issueKey);
+  const data = await jiraRequest(config, `/issue/${encodeURIComponent(issueKey)}/comment`, {
+    queryParams: { startAt, maxResults }
+  });
+  const comments = (Array.isArray(data.comments) ? data.comments : []).map((comment) => ({
+    ...normalizeComment(comment),
+    visibility: comment?.visibility ? {
+      type: comment.visibility.type ?? null,
+      value: comment.visibility.value ?? null
+    } : null
+  }));
+  return jsonContent({
+    issueKey,
+    url: buildIssueUrl(config.baseUrl, issueKey),
+    startAt: data.startAt ?? startAt,
+    maxResults: data.maxResults ?? maxResults,
+    total: data.total ?? null,
+    count: comments.length,
+    comments
+  });
 }
 
 async function jiraListProjects(args) {
